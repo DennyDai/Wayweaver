@@ -78,7 +78,58 @@ def describe(pyatspi, node, path):
     return item
 
 
-def walk(pyatspi, node, path=(), depth=0, max_depth=12):
+# Chrome nests page content roughly fifty levels below the desktop root, so
+# a shallow walk sees only browser chrome and every web lookup falls back to
+# OCR. A full walk of a loaded page costs a few hundred milliseconds.
+DEFAULT_MAX_DEPTH = 60
+
+
+def scope_root(pyatspi, options):
+    """Return the node a search should start from.
+
+    Walking the whole desktop makes a lookup both slow and ambiguous: reaching
+    a late-registering application costs seconds, and a common label such as
+    "File" matches whichever application the walk happens to reach first.
+    Naming an application starts the walk inside it.
+    """
+    desktop = pyatspi.Registry.getDesktop(0)
+    wanted = str(options.get("application", "")).casefold()
+    if not wanted:
+        return desktop
+    literal = str(options.get("application", ""))
+    cased, exact, partial = [], [], []
+    for index in range(desktop.childCount):
+        try:
+            application = desktop.getChildAtIndex(index)
+            name = application.name or ""
+        except Exception:
+            continue
+        if name == literal:
+            # Naming an application exactly is unambiguous by construction, so
+            # stop here rather than paying to interrogate every later
+            # application -- one slow toolkit can cost seconds per lookup.
+            return application
+        if name.casefold() == wanted:
+            exact.append((application, name))
+        elif wanted in name.casefold():
+            partial.append((application, name))
+    # Several applications can share a name fragment -- a file manager and its
+    # daemon both answer to "thunar" -- and silently taking the first is how a
+    # lookup ends up searching the wrong process. Case is the finest
+    # distinction available, so try it before giving up.
+    for candidates in (cased, exact, partial):
+        if len(candidates) == 1:
+            return candidates[0][0]
+        if len(candidates) > 1:
+            names = sorted({name for _, name in candidates})
+            raise ValueError(
+                f"ambiguous application {literal!r}: matches {names}; "
+                "name it exactly, including case"
+            )
+    raise ValueError(f"accessible application not found: {literal!r}")
+
+
+def walk(pyatspi, node, path=(), depth=0, max_depth=DEFAULT_MAX_DEPTH):
     yield node, path
     if depth >= max_depth:
         return
@@ -94,6 +145,35 @@ def walk(pyatspi, node, path=(), depth=0, max_depth=12):
             continue
 
 
+# Role names are toolkit vocabulary, not a shared one: the same widget is
+# "push button" to GTK and Chrome but "button" to the Java ATK bridge, so an
+# exact comparison silently fails across toolkits. Compare normalized names and
+# treat known synonyms as one role.
+_ROLE_GROUPS = (
+    {"button", "pushbutton"},
+    {"entry", "text", "textfield", "textbox"},
+    {"checkbox", "checkbutton"},
+    {"radiobutton", "radio"},
+    {"combobox", "comboboxlist", "popupmenu"},
+    {"pagetab", "tab"},
+    {"static", "label"},
+)
+
+
+def normalize_role(value):
+    return "".join(character for character in str(value).casefold()
+                   if character.isalnum())
+
+
+def role_matches(wanted, actual):
+    if not wanted:
+        return True
+    wanted, actual = normalize_role(wanted), normalize_role(actual)
+    if wanted == actual:
+        return True
+    return any(wanted in group and actual in group for group in _ROLE_GROUPS)
+
+
 def matches(node, options):
     try:
         name = (node.name or "").casefold()
@@ -107,7 +187,7 @@ def matches(node, options):
             return False
         if not options.get("exact") and wanted_name not in name:
             return False
-    if wanted_role and wanted_role != role:
+    if wanted_role and not role_matches(wanted_role, role):
         return False
     return bool(wanted_name or wanted_role)
 
@@ -142,20 +222,76 @@ def is_on_screen(pyatspi, node, size):
         return True
 
 
+def role_constants(pyatspi):
+    """Normalized role name -> AT-SPI role constant, derived from pyatspi."""
+    constants = {}
+    for name, value in vars(pyatspi).items():
+        if name.startswith("ROLE_") and isinstance(value, int):
+            constants[normalize_role(name[5:].replace("_", " "))] = value
+    return constants
+
+
+def collection_candidates(pyatspi, root, options):
+    """Ask the application to find nodes of a role, instead of walking to them.
+
+    A recursive walk costs one round trip per node, and a large toolkit tree
+    runs to tens of thousands. The Collection interface performs the same
+    search inside the application and returns only the matches.
+    """
+    wanted = normalize_role(options.get("role", ""))
+    if not wanted:
+        return None
+    constants = role_constants(pyatspi)
+    roles = {constants[wanted]} if wanted in constants else set()
+    for group in _ROLE_GROUPS:
+        if wanted in group:
+            roles |= {constants[alias] for alias in group if alias in constants}
+    if not roles:
+        return None
+    try:
+        collection = root.queryCollection()
+        rule = collection.createMatchRule(
+            pyatspi.StateSet().raw(), collection.MATCH_ALL,
+            {}, collection.MATCH_ALL,
+            sorted(roles), collection.MATCH_ANY,
+            [], collection.MATCH_ALL, False,
+        )
+        return collection.getMatches(rule, collection.SORT_ORDER_CANONICAL, 0, True)
+    except Exception:
+        return None
+
+
 def find(pyatspi, options):
-    desktop = pyatspi.Registry.getDesktop(0)
+    desktop = scope_root(pyatspi, options)
     size = screen_size()
     found = []
     requested_nth = int(options.get("nth", 0))
     default_limit = requested_nth + 1 if requested_nth >= 0 else 100
     limit = max(default_limit, int(options.get("limit", default_limit)))
-    for node, path in walk(pyatspi, desktop, max_depth=int(options.get("max_depth", 12))):
+    candidates = collection_candidates(pyatspi, desktop, options)
+    stream = (
+        ((node, ()) for node in candidates)
+        if candidates is not None
+        else walk(pyatspi, desktop, max_depth=int(options.get("max_depth", DEFAULT_MAX_DEPTH)))
+    )
+    # An off-screen match is worth reporting -- an element below the fold can be
+    # scrolled to, while calling it missing sends the caller to OCR, which
+    # matches the same word in nearby prose. It must never outrank a visible
+    # one, though, so they are collected separately and appended after. Ranking
+    # here rather than making the caller ask twice matters: a search that
+    # matches nothing walks the whole desktop and costs ~60x one that hits.
+    include_offscreen = bool(options.get("include_offscreen", False))
+    offscreen = []
+    for node, path in stream:
         if matches(node, options):
-            if not options.get("include_offscreen", False) and not is_on_screen(pyatspi, node, size):
+            if not is_on_screen(pyatspi, node, size):
+                if include_offscreen:
+                    offscreen.append((node, path))
                 continue
             found.append((node, path))
             if len(found) >= limit:
                 break
+    found.extend(offscreen[: max(0, limit - len(found))])
     nth = requested_nth
     nth = nth if nth >= 0 else len(found) + nth
     if not 0 <= nth < len(found):
@@ -186,26 +322,70 @@ def assert_element(pyatspi, options):
 
 
 
-def main():
-    pyatspi = import_atspi()
-    action = sys.argv[1] if len(sys.argv) > 1 else "probe"
+def serve(pyatspi):
+    """Answer newline-delimited requests over stdin for the life of the process.
+
+    libatspi initializes its cache by calling GetItems on every application, so
+    each new client pays for marshalling every accessible tree on the desktop --
+    seconds, for a large toolkit. Holding one client open pays that once.
+    """
+    print(json.dumps({"ready": True}), flush=True)
+    while True:
+        # Iterating sys.stdin reads ahead into a buffer, so a request would sit
+        # unanswered until the buffer filled; readline returns each line as it
+        # arrives.
+        line = sys.stdin.readline()
+        if not line:
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+            result = dispatch(pyatspi, str(request.get("action", "probe")),
+                              request.get("options") or {})
+            print(json.dumps({"ok": True, "result": result}), flush=True)
+        except Exception as error:
+            print(json.dumps({"ok": False, "error": str(error)}), flush=True)
+
+
+def dispatch(pyatspi, action, options):
     if action == "probe":
         desktop = pyatspi.Registry.getDesktop(0)
-        print(json.dumps({"desktop": desktop.name, "applications": desktop.childCount}))
-        return
-    options = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+        return {"desktop": desktop.name, "applications": desktop.childCount}
     if action == "list":
-        desktop = pyatspi.Registry.getDesktop(0)
+        desktop = scope_root(pyatspi, options)
         limit = int(options.get("limit", 500))
         result = []
-        for node, path in walk(pyatspi, desktop, max_depth=int(options.get("max_depth", 8))):
+        for node, path in walk(pyatspi, desktop, max_depth=int(options.get("max_depth", DEFAULT_MAX_DEPTH))):
             item = describe(pyatspi, node, path)
             if item["name"] or item["role"]:
                 result.append(item)
             if len(result) >= limit:
                 break
-        print(json.dumps({"elements": result, "truncated": len(result) >= limit}))
-        return
+        return {"elements": result, "truncated": len(result) >= limit}
+    if action == "focused":
+        # Typing goes wherever focus happens to be. Without a way to ask what
+        # that is, a click that missed its target types into nothing and no
+        # layer notices.
+        desktop = scope_root(pyatspi, options)
+        for node, path in walk(
+            pyatspi, desktop, max_depth=int(options.get("max_depth", DEFAULT_MAX_DEPTH))
+        ):
+            try:
+                if "focused" not in states(pyatspi, node):
+                    continue
+            except Exception:
+                continue
+            item = describe(pyatspi, node, path)
+            try:
+                text = node.queryText()
+                item["text"] = text.getText(0, text.characterCount)
+            except Exception:
+                pass
+            return item
+        raise ValueError("no accessible element currently has focus")
+
     node, result = assert_element(pyatspi, options)
     if action in {"find", "assert", "read"}:
         if action == "read":
@@ -214,8 +394,7 @@ def main():
                 result["text"] = text.getText(0, text.characterCount)
             except Exception:
                 pass
-        print(json.dumps(result))
-        return
+        return result
     if action == "invoke":
         method = str(options.get("method", "pointer")).casefold()
         if method == "native":
@@ -255,7 +434,17 @@ def main():
             result["value"] = value.currentValue
     else:
         raise ValueError(f"unknown action: {action}")
-    print(json.dumps(result))
+    return result
+
+
+def main():
+    pyatspi = import_atspi()
+    action = sys.argv[1] if len(sys.argv) > 1 else "probe"
+    if action == "serve":
+        serve(pyatspi)
+        return
+    options = {} if action == "probe" or sys.stdin.isatty() else json.load(sys.stdin)
+    print(json.dumps(dispatch(pyatspi, action, options)))
 
 
 if __name__ == "__main__":

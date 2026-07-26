@@ -387,10 +387,15 @@ async def _probe_requirement(
     transport: "Adapter", name: str, kind: str, package: str, platform: str
 ) -> dict[str, Any]:
     if platform == "windows":
+        # The runtime requirement is PowerShell's UI Automation assembly; any
+        # other requirement is a command, and hard-coding the assembly check
+        # would silently report on the wrong thing once one is added.
         command = (
             "$ErrorActionPreference = 'Stop'; "
             "Add-Type -AssemblyName UIAutomationClient; "
             "$PSVersionTable.PSVersion.ToString()"
+            if kind == "runtime"
+            else f"$ErrorActionPreference = 'Stop'; (Get-Command {name}).Version.ToString()"
         )
     elif kind == "python_module":
         command = f"python3 -c 'import {name}'"

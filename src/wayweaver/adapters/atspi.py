@@ -6,7 +6,7 @@ from typing import Any
 from ..errors import ActionError, ConfigError
 from ..runtime import linux_path_export
 from ..types import Capability
-from .base import Adapter, require_shell_transport
+from .base import Adapter, ShellSession, require_shell_transport
 
 
 class ATSPIAdapter(Adapter):
@@ -28,6 +28,9 @@ class ATSPIAdapter(Adapter):
         if not helper:
             raise ConfigError("atspi command cannot be empty")
         self.helper_command = " ".join(shlex.quote(value) for value in helper)
+        self._session: ShellSession | None = None
+        self._session_lock = asyncio.Lock()
+        self._timeout = float(config.get("timeout", 30))
 
     def _command(self, action: str) -> str:
         environment = linux_path_export()
@@ -38,7 +41,50 @@ class ATSPIAdapter(Adapter):
             f"{self.helper_command} {shlex.quote(action)}"
         )
 
+    async def _session_call(self, action: str, params: dict[str, Any]) -> Any:
+        """Answer through a persistent helper, or None if one is unavailable.
+
+        libatspi builds its cache by marshalling every application's tree at
+        startup, so a one-shot helper pays that on every call -- seconds when a
+        large toolkit is running. A session pays it once.
+        """
+        if self.config.get("session", True) is False:
+            return None
+        async with self._session_lock:
+            if self._session is None:
+                session = await self.transport.open_session(self._command("serve"))
+                if session is None:
+                    return None
+                try:
+                    hello = await session.banner(self._timeout)
+                except (ActionError, asyncio.TimeoutError, OSError, ValueError):
+                    await session.close()
+                    return None
+                if not hello.get("ready"):
+                    await session.close()
+                    return None
+                self._session = session
+            session = self._session
+        try:
+            reply = await session.request(
+                {"action": action, "options": params}, self._timeout
+            )
+        except (ActionError, asyncio.TimeoutError, OSError, ValueError):
+            # A broken session must not be reused; the next call reconnects.
+            async with self._session_lock:
+                if self._session is session:
+                    self._session = None
+            await session.close()
+            raise
+        if not reply.get("ok"):
+            raise ActionError(str(reply.get("error", "AT-SPI helper failed")))
+        return reply.get("result")
+
     async def _call(self, action: str, params: dict[str, Any] | None = None) -> Any:
+        if action != "probe":
+            result = await self._session_call(action, params or {})
+            if result is not None:
+                return result
         stdin = json.dumps(params or {}).encode() if params is not None else None
         code, stdout, stderr = await self.transport.shell(self._command(action), stdin)
         if code:
@@ -83,6 +129,7 @@ class ATSPIAdapter(Adapter):
             "element.activate": "invoke",
             "element.focus": "focus",
             "element.read": "read",
+            "element.focused": "focused",
             "element.set_value": "set-value",
         }
         if operation == "element.wait":
@@ -90,6 +137,11 @@ class ATSPIAdapter(Adapter):
         if action := actions.get(operation):
             return await self._call(action, params)
         return await super().perform(operation, params)
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
     async def raw(self, operation: str, params: dict[str, Any]) -> Any:
         if operation != "tree":
