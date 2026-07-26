@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import shutil
 from typing import Any
 
@@ -6,7 +7,7 @@ from ..errors import ActionError
 from ..image import png_size
 from ..types import Capability, Frame
 from .base import Adapter, key_expressions
-from .android_ui import AndroidUI
+from .android_ui import AndroidUI, input_text_argument
 
 _KEYEVENTS = {
     "backspace": "KEYCODE_DEL",
@@ -29,6 +30,16 @@ _KEYEVENTS = {
     "end": "KEYCODE_MOVE_END",
     "insert": "KEYCODE_INSERT",
     "menu": "KEYCODE_MENU",
+    "caps_lock": "KEYCODE_CAPS_LOCK",
+    "print": "KEYCODE_SYSRQ",
+    "ctrl": "KEYCODE_CTRL_LEFT",
+    "control": "KEYCODE_CTRL_LEFT",
+    "alt": "KEYCODE_ALT_LEFT",
+    "shift": "KEYCODE_SHIFT_LEFT",
+    "meta": "KEYCODE_META_LEFT",
+    "super": "KEYCODE_META_LEFT",
+    # Android defines no keycode past F12, so the contract's F13-F24 are
+    # refused by name rather than handed to the device as an unknown token.
     **{f"f{index}": f"KEYCODE_F{index}" for index in range(1, 13)},
 }
 
@@ -111,7 +122,12 @@ class ADBAdapter(Adapter):
     async def shell(
         self, command: str, stdin: bytes | None = None
     ) -> tuple[int, bytes, bytes]:
-        return await self._run("shell", "sh", "-c", command, stdin=stdin)
+        # adb joins the arguments after `shell` into one string, so an unquoted
+        # command loses its own quoting: `sh -c "ls -la"` arrives as
+        # `sh -c ls -la`, which runs ls with -la as $0 rather than as a flag.
+        return await self._run(
+            "shell", "sh", "-c", shlex.quote(command), stdin=stdin
+        )
 
     async def act(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         if action in {"click", "double_click"}:
@@ -145,13 +161,27 @@ class ADBAdapter(Adapter):
             return {"direction": direction, "amount": amount}
         if action == "type":
             text = str(params.get("text", ""))
-            encoded = text.replace("%", "%25").replace(" ", "%s")
-            await self._checked("shell", "input", "text", encoded)
+            if text:
+                await self._checked(
+                    "shell", "input", "text", input_text_argument(text)
+                )
             return {"characters": len(text)}
         if action in {"key", "hotkey"}:
             keys = key_expressions(params)
+            # `input keyevent` presses and releases one key at a time, so a
+            # chord sent this way arrives as Ctrl, then A -- which selects
+            # nothing while reporting success. Refuse rather than pretend.
+            if action == "hotkey" or any("+" in str(key) for key in keys):
+                raise ActionError(
+                    "the Android backend cannot press a key chord; "
+                    "`input keyevent` releases each key before the next"
+                )
             for key in keys:
-                event = _KEYEVENTS.get(str(key).casefold(), str(key))
+                event = _KEYEVENTS.get(str(key).casefold())
+                if event is None:
+                    # Passing an unmapped name through reached the device as an
+                    # unknown token inside a shell command.
+                    raise ActionError(f"unknown Android key: {key}")
                 await self._checked("shell", "input", "keyevent", event)
             return {"keys": keys}
         raise ActionError(f"unsupported Android action: {action}")

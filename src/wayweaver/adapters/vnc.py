@@ -39,7 +39,7 @@ _KEYSYMS = {
     "caps_lock": 0xFFE5,
     "print": 0xFF61,
     "menu": 0xFF67,
-    **{f"f{index}": 0xFFBE + index - 1 for index in range(1, 13)},
+    **{f"f{index}": 0xFFBE + index - 1 for index in range(1, 25)},
 }
 
 
@@ -241,7 +241,7 @@ class VNCAdapter(Adapter):
         if (
             lowered.startswith("f")
             and lowered[1:].isdigit()
-            and 1 <= int(lowered[1:]) <= 12
+            and 1 <= int(lowered[1:]) <= 24
         ):
             return 0xFFBD + int(lowered[1:])
         raise ActionError(f"unknown VNC key: {value}")

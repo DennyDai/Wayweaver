@@ -25,6 +25,7 @@ _VIRTUAL_KEYS = {
     "print": "VK_SNAPSHOT",
     "menu": "VK_APPS",
     "super": "VK_LWIN",
+    "meta": "VK_LWIN",
     "left": "VK_LEFT",
     "up": "VK_UP",
     "right": "VK_RIGHT",
@@ -50,12 +51,30 @@ class RDPAdapter(Adapter):
         self._lock = asyncio.Lock()
         self.pointer = (0, 0)
 
+    def _fail(self, error: Any) -> None:
+        """Raise an aardwolf error, discarding the connection it came from.
+
+        The connection is cached, so once the session drops every later call is
+        made against the same corpse and fails identically until the process
+        restarts.
+        """
+        self.connection = None
+        raise ActionError(str(error))
+
     async def available(self) -> tuple[bool, str | None]:
         try:
             __import__("aardwolf")
-            return True, None
         except ImportError:
             return False, "install wayweaver-agent[rdp] for RDP support"
+        # Reporting availability from an import alone made an unreachable host
+        # look usable, so routing preferred it over a working adapter and every
+        # operation then failed. Availability means the session connects.
+        try:
+            async with self._lock:
+                await self._ensure()
+        except Exception as error:
+            return False, str(error)
+        return True, None
 
     async def _ensure(self):
         if self.connection is not None:
@@ -93,7 +112,7 @@ class RDPAdapter(Adapter):
             )
             while not connection.desktop_buffer_has_data:
                 if asyncio.get_running_loop().time() >= deadline:
-                    raise ActionError("RDP framebuffer timed out")
+                    self._fail("RDP framebuffer timed out")
                 await asyncio.sleep(0.1)
             image = connection.get_desktop_buffer(VIDEO_FORMAT.PIL)
             if isinstance(image, tuple):
@@ -112,7 +131,7 @@ class RDPAdapter(Adapter):
         else:
             raise ActionError(f"unknown RDP key: {value}")
         if error:
-            raise ActionError(str(error))
+            self._fail(error)
 
     async def act(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         from aardwolf.commons.queuedata.constants import MOUSEBUTTON
@@ -125,7 +144,7 @@ class RDPAdapter(Adapter):
                     MOUSEBUTTON.MOUSEBUTTON_HOVER, *self.pointer, False
                 )
                 if error:
-                    raise ActionError(str(error))
+                    self._fail(error)
                 points, duration = trajectory(
                     self.pointer, target, params.get("duration_ms")
                 )
@@ -136,7 +155,7 @@ class RDPAdapter(Adapter):
                         MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False
                     )
                     if error:
-                        raise ActionError(str(error))
+                        self._fail(error)
                     if delay:
                         await asyncio.sleep(delay)
                 self.pointer = target
@@ -163,7 +182,7 @@ class RDPAdapter(Adapter):
                     MOUSEBUTTON.MOUSEBUTTON_HOVER, *self.pointer, False
                 )
                 if error:
-                    raise ActionError(str(error))
+                    self._fail(error)
                 approach, approach_duration = trajectory(self.pointer, start)
                 approach_delay = approach_duration / max(1, len(approach)) / 1000
                 for point in approach:
@@ -171,14 +190,14 @@ class RDPAdapter(Adapter):
                         MOUSEBUTTON.MOUSEBUTTON_HOVER, *point, False
                     )
                     if error:
-                        raise ActionError(str(error))
+                        self._fail(error)
                     if approach_delay:
                         await asyncio.sleep(approach_delay)
                 _, error = await connection.send_mouse(
                     MOUSEBUTTON.MOUSEBUTTON_LEFT, *start, True
                 )
                 if error:
-                    raise ActionError(str(error))
+                    self._fail(error)
                 points, duration = trajectory(start, end, params.get("duration_ms"))
                 delay = duration / max(1, len(points)) / 1000
                 for point in points:
@@ -186,14 +205,14 @@ class RDPAdapter(Adapter):
                         MOUSEBUTTON.MOUSEBUTTON_LEFT, *point, True
                     )
                     if error:
-                        raise ActionError(str(error))
+                        self._fail(error)
                     if delay:
                         await asyncio.sleep(delay)
                 _, error = await connection.send_mouse(
                     MOUSEBUTTON.MOUSEBUTTON_LEFT, *end, False
                 )
                 if error:
-                    raise ActionError(str(error))
+                    self._fail(error)
                 self.pointer = end
                 return {"from": list(start), "to": list(end)}
             if action == "scroll":
@@ -210,7 +229,7 @@ class RDPAdapter(Adapter):
                 for _ in range(max(0, int(params.get("amount", 3)))):
                     _, error = await connection.send_mouse(button, x, y, False, 120)
                     if error:
-                        raise ActionError(str(error))
+                        self._fail(error)
                 return {
                     "direction": direction,
                     "amount": int(params.get("amount", 3)),

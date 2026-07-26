@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -203,3 +205,167 @@ class WaylandBackendTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeyVocabularyParityTests(unittest.IsolatedAsyncioTestCase):
+    """Every canonical key name must reach every backend that can express it.
+
+    A name a backend does not know is not an error the caller sees: it is
+    dropped, the action reports success, and the desktop never changed. This
+    walks the whole advertised vocabulary through each backend rather than
+    comparing tables, because several backends normalize a name before looking
+    it up.
+    """
+
+    @staticmethod
+    def canonical():
+        from wayweaver.contracts import _KEY_ALIASES
+
+        return sorted(set(_KEY_ALIASES.values()))
+
+    def test_vnc_expresses_every_canonical_key(self):
+        from wayweaver.adapters.vnc import VNCAdapter
+
+        adapter = VNCAdapter("vnc", {"host": "h"})
+        for key in self.canonical():
+            with self.subTest(key=key):
+                self.assertIsInstance(adapter._keysym(key), int)
+
+    def test_rdp_expresses_every_canonical_key(self):
+        from wayweaver.adapters.rdp import _VIRTUAL_KEYS
+
+        for key in self.canonical():
+            with self.subTest(key=key):
+                self.assertTrue(len(key) == 1 or key.casefold() in _VIRTUAL_KEYS)
+
+    async def test_cdp_sends_a_virtual_key_code_for_every_canonical_key(self):
+        from wayweaver.adapters.cdp import CDPAdapter
+
+        # Without a virtual key code the browser accepts the event and the page
+        # ignores it, which is the silent failure this vocabulary exists to stop.
+        adapter = CDPAdapter("cdp", {"url": "http://localhost"})
+        events = []
+
+        async def browser(method, params):
+            events.append(params)
+            return {}
+
+        adapter.browser = browser
+        for key in self.canonical():
+            with self.subTest(key=key):
+                events.clear()
+                await adapter.act("key", {"key": key})
+                self.assertTrue(
+                    any(item.get("type") == "rawKeyDown" for item in events),
+                    f"{key} reached the page without a virtual key code",
+                )
+
+    def test_android_maps_the_keys_the_platform_defines(self):
+        from wayweaver.adapters.adb import _KEYEVENTS
+
+        # Android has no keycode past F12, so those stay absent deliberately
+        # and are refused by name at the call site.
+        missing = [
+            key
+            for key in self.canonical()
+            if key.casefold() not in _KEYEVENTS and len(key) > 1
+        ]
+        self.assertEqual(missing, [f"F{index}" for index in range(13, 25)])
+
+
+class AndroidShellQuotingTests(unittest.IsolatedAsyncioTestCase):
+    """adb joins everything after `shell` into one command string.
+
+    An unquoted argument therefore leaves the text's own metacharacters active
+    on the device.
+    """
+
+    def adapter(self):
+        adapter = ADBAdapter("adb", {})
+        sent = []
+
+        async def checked(*args):
+            sent.append(args)
+            return b""
+
+        adapter._checked = checked
+        return adapter, sent
+
+    async def test_typed_text_cannot_run_a_second_command(self):
+        adapter, sent = self.adapter()
+        await adapter.act("type", {"text": "x; rm -rf /"})
+        argument = sent[-1][-1]
+        self.assertTrue(argument.startswith("'") and argument.endswith("'"))
+        self.assertNotIn("; rm", argument.strip("'").replace("%s", " ")[:2])
+
+    async def test_typed_text_keeps_a_quote_intact(self):
+        adapter, sent = self.adapter()
+        await adapter.act("type", {"text": "it's"})
+        self.assertEqual(sent[-1][-1], """'it'"'"'s'""")
+
+    async def test_shell_command_keeps_its_own_arguments(self):
+        # `sh -c "ls -la"` arrived as `sh -c ls -la`, which runs ls with -la
+        # as $0 rather than as a flag.
+        adapter = ADBAdapter("adb", {})
+        seen = []
+
+        async def run(*args, stdin=None):
+            seen.append(args)
+            return 0, b"", b""
+
+        adapter._run = run
+        await adapter.shell("ls -la /sdcard")
+        self.assertEqual(seen[-1], ("shell", "sh", "-c", "'ls -la /sdcard'"))
+
+    async def test_an_unknown_key_is_refused_not_forwarded(self):
+        adapter, sent = self.adapter()
+        with self.assertRaises(ActionError):
+            await adapter.act("key", {"key": "F13"})
+        self.assertEqual(sent, [])
+
+    async def test_a_chord_is_refused_rather_than_pressed_in_sequence(self):
+        adapter, sent = self.adapter()
+        with self.assertRaises(ActionError) as caught:
+            await adapter.act("hotkey", {"keys": ["ctrl+a"]})
+        self.assertIn("chord", str(caught.exception))
+        self.assertEqual(sent, [])
+
+
+class RDPSessionTests(unittest.IsolatedAsyncioTestCase):
+    """A cached connection must not outlive the session it belongs to."""
+
+    def adapter(self):
+        from wayweaver.adapters.rdp import RDPAdapter
+
+        adapter = RDPAdapter("rdp", {"url": "rdp://host"})
+        adapter.connection = object()
+        return adapter
+
+    async def test_a_failed_send_discards_the_connection(self):
+        adapter = self.adapter()
+        with self.assertRaises(ActionError):
+            adapter._fail("connection reset")
+        self.assertIsNone(adapter.connection)
+
+    async def test_availability_reports_a_host_it_cannot_reach(self):
+        # Availability used to follow from the library importing, so an
+        # unreachable host looked usable and routing preferred it over an
+        # adapter that worked.
+        adapter = self.adapter()
+        adapter.connection = None
+
+        async def refuse():
+            raise ActionError("connection refused")
+
+        adapter._ensure = refuse
+        with patch.dict(sys.modules, {"aardwolf": types.ModuleType("aardwolf")}):
+            available, reason = await adapter.available()
+        self.assertFalse(available)
+        self.assertIn("refused", reason)
+
+    async def test_availability_still_reports_a_missing_library(self):
+        adapter = self.adapter()
+        with patch.dict(sys.modules, {"aardwolf": None}):
+            available, reason = await adapter.available()
+        self.assertFalse(available)
+        self.assertIn("wayweaver-agent[rdp]", reason)

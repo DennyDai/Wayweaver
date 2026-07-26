@@ -37,7 +37,16 @@ _CDP_VIRTUAL_KEYS = {
     "ArrowDown": 40,
     "Insert": 45,
     "Delete": 46,
-    **{f"F{index}": 111 + index for index in range(1, 13)},
+    # A key without a virtual key code is accepted by the protocol and then
+    # ignored by the page, so every name the contract advertises needs one.
+    "Shift": 16,
+    "Control": 17,
+    "Alt": 18,
+    "Meta": 91,
+    "CapsLock": 20,
+    "PrintScreen": 44,
+    "ContextMenu": 93,
+    **{f"F{index}": 111 + index for index in range(1, 25)},
 }
 
 
@@ -353,6 +362,8 @@ class CDPAdapter(Adapter):
                     "right": "ArrowRight",
                     "caps_lock": "CapsLock",
                     "super": "Meta",
+                    "print": "PrintScreen",
+                    "menu": "ContextMenu",
                 }.get(raw_key.casefold(), raw_key)
                 event: dict[str, Any] = {"key": key, "modifiers": modifiers}
                 if (code := _CDP_VIRTUAL_KEYS.get(key)) is not None:

@@ -1,5 +1,6 @@
 import asyncio
 import re
+import shlex
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
@@ -9,6 +10,18 @@ from ..errors import ActionError
 
 RunChecked = Callable[..., Awaitable[bytes]]
 _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+
+def input_text_argument(text: str) -> str:
+    """Encode text for `input text`, quoted for the shell adb runs it in.
+
+    adb joins everything after `shell` into one string and hands it to the
+    device shell, so an unquoted argument leaves every metacharacter in the
+    text active: a quote breaks the command and a semicolon runs the remainder
+    as a separate one. `input` itself treats a space as an argument boundary
+    and reads %s as a space.
+    """
+    return shlex.quote(text.replace("%", "%25").replace(" ", "%s"))
 
 
 def _boolean(value: str | None) -> bool:
@@ -207,9 +220,8 @@ class AndroidUI:
                         "shell", "input", "keyevent", *(["KEYCODE_DEL"] * len(current))
                     )
             text = str(options["text"])
-            encoded = text.replace("%", "%25").replace(" ", "%s")
-            if encoded:
-                await self.run("shell", "input", "text", encoded)
+            if text:
+                await self.run("shell", "input", "text", input_text_argument(text))
             element["value"] = text
             return element
         raise ActionError(f"unsupported Android element operation: {operation}")
