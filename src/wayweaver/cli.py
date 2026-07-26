@@ -10,15 +10,21 @@ from .sequence import run_sequence
 from .errors import error_payload
 
 
-def load_json(value: str) -> Any:
+def load_json(value: str, allow_path: bool = False) -> Any:
+    """Parse inline JSON, or a file/stdin when the argument documents that.
+
+    Only `run` advertises a file path, so treating every params argument as a
+    possible filename made behaviour depend on what happened to exist on disk.
+    """
     if value == "-":
         return json.load(sys.stdin)
-    try:
-        path = Path(value)
-        if path.is_file():
-            return json.loads(path.read_text())
-    except OSError:
-        pass
+    if allow_path:
+        try:
+            path = Path(value)
+            if path.is_file():
+                return json.loads(path.read_text())
+        except (OSError, ValueError):
+            pass
     return json.loads(value)
 
 
@@ -47,7 +53,7 @@ async def execute(args: argparse.Namespace) -> Any:
                 args.target, args.operation, load_json(args.params)
             )
         if args.command == "run":
-            payload = load_json(args.sequence)
+            payload = load_json(args.sequence, allow_path=True)
             if isinstance(payload, list):
                 steps, options = payload, {}
             else:

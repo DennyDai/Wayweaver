@@ -8,7 +8,7 @@ from typing import Any
 from .errors import ConfigError
 
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
-_RESERVED = {"prefer", "cache_dir"}
+_RESERVED = {"prefer", "cache_dir", "probe_ttl"}
 
 
 def _expand(value: Any) -> Any:
@@ -35,6 +35,7 @@ class TargetConfig:
     name: str
     prefer: tuple[str, ...]
     adapters: dict[str, dict[str, Any]]
+    probe_ttl: float = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,13 @@ def load_config(path: str | Path | None = None) -> Config:
             isinstance(item, str) for item in preferred
         ):
             raise ConfigError(f"target {name} prefer must be a string array")
+        probe_ttl = table.get("probe_ttl", 30)
+        if (
+            isinstance(probe_ttl, bool)
+            or not isinstance(probe_ttl, (int, float))
+            or probe_ttl < 0
+        ):
+            raise ConfigError(f"target {name} probe_ttl must be a non-negative number")
         invalid = [
             key
             for key, value in table.items()
@@ -84,6 +92,6 @@ def load_config(path: str | Path | None = None) -> Config:
         adapters = {key: value for key, value in table.items() if key not in _RESERVED}
         if not adapters:
             raise ConfigError(f"target {name} has no adapters")
-        targets[name] = TargetConfig(name, prefer, adapters)
+        targets[name] = TargetConfig(name, prefer, adapters, float(probe_ttl))
     cache = Path(raw.get("cache_dir", "~/.cache/wayweaver")).expanduser()
     return Config(targets, cache)

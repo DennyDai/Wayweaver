@@ -58,11 +58,18 @@ class Router:
 
     async def probe(self) -> dict[str, AdapterStatus]:
         names = list(self.adapters)
+        # An adapter that raises instead of reporting unavailable used to
+        # abort the whole probe, leaving the target with no routing at all.
         results = await asyncio.gather(
-            *(self.adapters[name].available() for name in names)
+            *(self.adapters[name].available() for name in names),
+            return_exceptions=True,
         )
         status = {}
-        for name, (available, reason) in zip(names, results):
+        for name, outcome in zip(names, results):
+            if isinstance(outcome, BaseException):
+                available, reason = False, f"probe raised {type(outcome).__name__}: {outcome}"
+            else:
+                available, reason = outcome
             adapter = self.adapters[name]
             status[name] = AdapterStatus(
                 name,
@@ -74,6 +81,10 @@ class Router:
         self.status = status
         self.probed_at = time.monotonic()
         return status
+
+    async def _ensure_probed(self) -> None:
+        if not self.status or time.monotonic() - self.probed_at > self.target.probe_ttl:
+            await self.probe()
 
     def _ordered(self) -> list[Adapter]:
         preferred = list(self.target.prefer)
@@ -90,8 +101,7 @@ class Router:
         requirements: set[Capability],
         exclude: set[str] | None = None,
     ) -> Adapter | None:
-        if not self.status or time.monotonic() - self.probed_at > 5:
-            await self.probe()
+        await self._ensure_probed()
         excluded = exclude or set()
         for adapter in self._ordered():
             status = self.status[adapter.name]
@@ -137,8 +147,7 @@ class Router:
                     "examples": list(spec.examples),
                 }
         if include_raw:
-            if not self.status:
-                await self.probe()
+            await self._ensure_probed()
             for adapter in self._ordered():
                 status = self.status[adapter.name]
                 if status.available and adapter.raw_operations:
@@ -181,8 +190,7 @@ class Router:
     async def raw(
         self, adapter_name: str, operation: str, params: dict[str, object]
     ) -> object:
-        if not self.status or time.monotonic() - self.probed_at > 5:
-            await self.probe()
+        await self._ensure_probed()
         adapter = self.adapters.get(adapter_name)
         if adapter is None or not self.status[adapter_name].available:
             raise CapabilityError(

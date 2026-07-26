@@ -33,13 +33,20 @@ class ProvenanceStore:
             return self._secret
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         path = self.cache_dir / ".provenance-key"
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(os.urandom(32))
+        if not path.exists():
+            # Creating the file and filling it are two steps, so a second
+            # process could read the empty file in between and reject a
+            # perfectly good key. Write it elsewhere and move it into place,
+            # which other processes only ever observe as complete.
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(4).hex()}")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(os.urandom(32))
+                os.replace(temporary, path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
         secret = path.read_bytes()
         if len(secret) != 32:
             raise SurfaceError("provenance signing key is invalid", retryable=False)
