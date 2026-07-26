@@ -43,6 +43,30 @@ _KEYSYMS = {
 }
 
 
+def _text_keysym(character: str) -> int:
+    """Map one typed character to its X keysym.
+
+    A codepoint below 0x100 is its own keysym, which is why plain ASCII
+    happened to work when characters were sent as ord() -- and why everything
+    else silently vanished: X defines keysyms for the rest of Unicode at
+    0x01000000 + codepoint, so a raw codepoint names an unrelated key or
+    nothing. Newline and tab are control codes with no keysym of their own and
+    travel as Return and Tab.
+    """
+    codepoint = ord(character)
+    if codepoint in (0x0A, 0x0D):
+        return 0xFF0D
+    if codepoint == 0x09:
+        return 0xFF09
+    if 0x20 <= codepoint < 0x100:
+        return codepoint
+    if codepoint >= 0x100:
+        return 0x01000000 + codepoint
+    raise ActionError(
+        f"cannot type control character {codepoint:#04x}; use keyboard.press"
+    )
+
+
 def _exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -237,7 +261,7 @@ class VNCAdapter(Adapter):
         if lowered in _KEYSYMS:
             return _KEYSYMS[lowered]
         if len(value) == 1:
-            return ord(value)
+            return _text_keysym(value)
         if (
             lowered.startswith("f")
             and lowered[1:].isdigit()
@@ -309,7 +333,7 @@ class VNCAdapter(Adapter):
             if action == "type":
                 text = str(params.get("text", ""))
                 for character in text:
-                    keysym = ord(character)
+                    keysym = _text_keysym(character)
                     connection.key(keysym, True)
                     connection.key(keysym, False)
                 return {"characters": len(text)}
