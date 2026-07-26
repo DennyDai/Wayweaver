@@ -448,8 +448,40 @@ class X11Adapter(Adapter):
             return {"keys": keys}
         raise ActionError(f"unsupported X11 action: {action}")
 
+    @staticmethod
+    def _frame_extents(output: str) -> dict[str, tuple[int, int]]:
+        """Parse `id left,right,top,bottom` lines into id -> (left, top)."""
+        extents: dict[str, tuple[int, int]] = {}
+        for line in output.splitlines():
+            identifier, _, values = line.partition(" ")
+            numbers = [value for value in values.split(",") if value.strip()]
+            if len(numbers) == 4:
+                try:
+                    extents[identifier.casefold()] = (
+                        int(numbers[0]),
+                        int(numbers[2]),
+                    )
+                except ValueError:
+                    continue
+        return extents
+
     async def windows(self) -> list[dict[str, Any]]:
-        output = (await self._run("wmctrl -lpGx")).decode(errors="replace")
+        # wmctrl reports a window's position with its frame extents added on
+        # top of the client area's own coordinates, so a decorated window reads
+        # as starting below where it actually does -- 24px for this window
+        # manager, which is exactly the height of an application's menu bar.
+        # Anything scoped to the window rectangle then excludes the menu bar.
+        output = (
+            await self._run(
+                "wmctrl -lpGx; printf '%s\\n' ---; "
+                "wmctrl -l | cut -d' ' -f1 | while read -r id; do "
+                "printf '%s %s\\n' \"$id\" \"$(xprop -id \"$id\" "
+                "_NET_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p' "
+                "| tr -d ' ')\"; done"
+            )
+        ).decode(errors="replace")
+        listing, _, frames = output.partition("\n---\n")
+        extents = self._frame_extents(frames)
         active_output = (
             (await self._run("xdotool getactivewindow 2>/dev/null || true"))
             .decode(errors="replace")
@@ -457,7 +489,7 @@ class X11Adapter(Adapter):
         )
         active = int(active_output) if active_output.isdigit() else None
         windows = []
-        for line in output.splitlines():
+        for line in listing.splitlines():
             parts = line.split(None, 9)
             if len(parts) == 10:
                 (
@@ -472,13 +504,14 @@ class X11Adapter(Adapter):
                     host,
                     title,
                 ) = parts
+                frame_left, frame_top = extents.get(window_id.casefold(), (0, 0))
                 windows.append(
                     {
                         "id": window_id,
                         "desktop": int(desktop),
                         "pid": int(pid),
-                        "x": int(x),
-                        "y": int(y),
+                        "x": int(x) - frame_left,
+                        "y": int(y) - frame_top,
                         "width": int(width),
                         "height": int(height),
                         "class": window_class,

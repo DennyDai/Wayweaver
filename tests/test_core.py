@@ -707,3 +707,68 @@ class PngSizeTests(unittest.TestCase):
         from wayweaver.image import encode_png, png_size
 
         self.assertEqual(png_size(encode_png(3, 2, b"\x00" * 18)), (3, 2))
+
+
+class WindowGeometryTests(unittest.IsolatedAsyncioTestCase):
+    """Window coordinates must describe the client area.
+
+    wmctrl reports a window's position with its frame extents added on top of
+    the client area's own coordinates, so a decorated window reads as starting
+    below where it actually does. Measured against xwininfo on the reference
+    desktop: wmctrl said y=75 for a window whose client area begins at y=51,
+    with a 24px frame -- exactly the height of an application's menu bar, so
+    anything scoped to the window rectangle excluded the menu bar.
+    """
+
+    LISTING = (
+        b"0x01c00339 0 238859 0 75 1600 849 ghidra.Ghidra host CodeBrowser\n"
+        b"0x02200007 0 166487 10 85 640 480 thunar.Thunar host vm - Thunar\n"
+    )
+
+    class GeometrySSH:
+        def __init__(self, frames=b""):
+            self.frames = frames
+            self.commands = []
+
+        async def shell(self, command, stdin=None):
+            self.commands.append(command)
+            if "wmctrl -lpGx" in command:
+                return 0, WindowGeometryTests.LISTING + b"---\n" + self.frames, b""
+            if "xdotool getactivewindow" in command:
+                return 0, b"", b""
+            return 0, b"", b""
+
+    def adapter(self, frames=b""):
+        from wayweaver.adapters.x11 import X11Adapter
+
+        return X11Adapter("x11", {"display": ":1"}, self.GeometrySSH(frames))
+
+    async def test_frame_extents_are_subtracted(self):
+        adapter = self.adapter(
+            b"0x01c00339 0,0,24,0\n0x02200007 5,5,29,5\n"
+        )
+        windows = {item["title"]: item for item in await adapter.windows()}
+        self.assertEqual((windows["CodeBrowser"]["x"], windows["CodeBrowser"]["y"]),
+                         (0, 51))
+        self.assertEqual((windows["vm - Thunar"]["x"], windows["vm - Thunar"]["y"]),
+                         (5, 56))
+
+    async def test_a_window_without_extents_keeps_its_coordinates(self):
+        adapter = self.adapter(b"0x01c00339 0,0,24,0\n")
+        windows = {item["title"]: item for item in await adapter.windows()}
+        self.assertEqual(windows["vm - Thunar"]["y"], 85)
+
+    async def test_missing_xprop_degrades_instead_of_failing(self):
+        # xprop is optional, so a desktop without it still lists windows.
+        adapter = self.adapter(b"")
+        windows = {item["title"]: item for item in await adapter.windows()}
+        self.assertEqual(windows["CodeBrowser"]["y"], 75)
+        self.assertEqual(len(windows), 2)
+
+    def test_extent_parsing_ignores_malformed_lines(self):
+        from wayweaver.adapters.x11 import X11Adapter
+
+        parsed = X11Adapter._frame_extents(
+            "0xaa 1,2,3,4\n0xbb not-numbers\n0xcc 1,2\nnoid\n0xdd 9,8,7,6\n"
+        )
+        self.assertEqual(parsed, {"0xaa": (1, 3), "0xdd": (9, 7)})
