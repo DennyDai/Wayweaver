@@ -220,6 +220,24 @@ Information and input do not have to come from the same adapter. VNC and RDP car
 
 The result carries `tier` (`semantic` or `visual`), `source` (the adapter that resolved it), and the `surface` the point was validated against. Feed `point` straight into `pointer.click`. Because layers can disagree about the desktop they describe, a point that falls outside the acting surface is refused rather than clicked.
 
+Give `element.point` a `timeout_ms` when the element may not exist yet — right after a navigation, the form you are resolving legitimately is not there for a moment — and a `scroll` budget when it may sit below the fold; resolution scrolls toward the element and waits for its reported position to stop moving before answering:
+
+```json
+{"element.point": {"selector": {"name": "Username", "role": "entry", "scroll": 6}, "timeout_ms": 15000, "allow_fallback": false}}
+```
+
+A resolved point is still a prediction: the page can reflow between resolving and the click landing, and a click that misses reports success while focusing nothing. For a click that the next steps depend on, verify where focus actually went and re-resolve on a miss:
+
+```json
+[
+  {"operation": "element.point", "params": {"selector": {"name": "Username", "role": "entry", "scroll": 6}}, "save_as": "field"},
+  {"operation": "pointer.click", "params": {"point": {"$ref": "field.data.point"}, "space": "screen"}},
+  {"operation": "element.focused", "params": {"application": "Chrome"}}
+]
+```
+
+Scope `element.focused` to the application when you can — an unscoped focus query walks every application on the desktop, which costs seconds when a large toolkit is registered against ~30ms scoped.
+
 Semantic operations fall back to the visual path on their own, which is roughly ten times slower and far easier to mislead. The switch is only reported afterwards in `backend.fallback`, and the OCR failure then replaces the real diagnostic — `text not found` where the truth was `accessible element not found`. Pass `allow_fallback: false` on any `element.*` call that should be semantic or nothing:
 
 ```json
