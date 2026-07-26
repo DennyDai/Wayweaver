@@ -220,6 +220,25 @@ async def _upload_posix_asset(
     return actual
 
 
+def _linux_activation_command(release_name: str) -> str:
+    checks = " ".join(
+        f'&& [ "$(sha256sum "$release/{asset.destination}" | cut -d\' \' -f1)" = "{asset_digest(asset)}" ]'
+        for asset in _LINUX_ASSETS
+    )
+    return (
+        f'root={_linux_root()}; release="$root/releases/{release_name}"; '
+        # Without the exit, a failed verification is decorative: the shell
+        # carries on past the `;` and activates the release anyway, with the
+        # overall exit status taken from the commands that follow.
+        f'active="$root/{RUNTIME_VERSION}"; test -f "$release/manifest.json" {checks} '
+        "|| exit 5; "
+        'link="$root/.activate.$$"; trap \'rm -f "$link"\' EXIT; '
+        f'ln -s "releases/{release_name}" "$link"; '
+        'if [ -e "$active" ] && [ ! -L "$active" ]; then rm -rf -- "$active"; fi; '
+        'mv -Tf "$link" "$active"; trap - EXIT'
+    )
+
+
 async def _install_linux(transport: "Adapter") -> list[dict[str, Any]]:
     root = _linux_root()
     release_name = _linux_release_name()
@@ -243,19 +262,7 @@ async def _install_linux(transport: "Adapter") -> list[dict[str, Any]]:
     manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
     manifest_asset = RuntimeAsset("manifest", (), "manifest.json")
     await _upload_posix_asset(transport, base_assignment, manifest_asset, manifest_data)
-    checks = " ".join(
-        f'&& [ "$(sha256sum "$release/{asset.destination}" | cut -d\' \' -f1)" = "{asset_digest(asset)}" ]'
-        for asset in _LINUX_ASSETS
-    )
-    command = (
-        f'root={root}; release="$root/releases/{release_name}"; '
-        f'active="$root/{RUNTIME_VERSION}"; test -f "$release/manifest.json" {checks}; '
-        'link="$root/.activate.$$"; trap \'rm -f "$link"\' EXIT; '
-        f'ln -s "releases/{release_name}" "$link"; '
-        'if [ -e "$active" ] && [ ! -L "$active" ]; then rm -rf -- "$active"; fi; '
-        'mv -Tf "$link" "$active"; trap - EXIT'
-    )
-    code, _, error = await _shell(transport, command)
+    code, _, error = await _shell(transport, _linux_activation_command(release_name))
     if code:
         raise ActionError(
             error or "failed to activate Linux runtime",
