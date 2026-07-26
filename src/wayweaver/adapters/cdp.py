@@ -15,7 +15,30 @@ from ..errors import ActionError, ProtocolError
 from ..image import png_size
 from ..motion import trajectory
 from ..types import Capability, Frame
-from .base import Adapter
+from .base import Adapter, key_expressions
+
+# Chrome only performs a key's default action -- scrolling, caret movement,
+# form submission -- when the event carries a virtual key code. Dispatching a
+# `key` name alone delivers an event the page can observe but the browser will
+# not act on, so navigation keys silently did nothing.
+_CDP_VIRTUAL_KEYS = {
+    "Backspace": 8,
+    "Tab": 9,
+    "Enter": 13,
+    "Escape": 27,
+    " ": 32,
+    "PageUp": 33,
+    "PageDown": 34,
+    "End": 35,
+    "Home": 36,
+    "ArrowLeft": 37,
+    "ArrowUp": 38,
+    "ArrowRight": 39,
+    "ArrowDown": 40,
+    "Insert": 45,
+    "Delete": 46,
+    **{f"F{index}": 111 + index for index in range(1, 13)},
+}
 
 
 class WebSocket:
@@ -148,26 +171,42 @@ class CDPAdapter(Adapter):
             raise ProtocolError("CDP has no page target")
         return str(pages[0]["webSocketDebuggerUrl"])
 
+    def _drop_socket(self) -> None:
+        socket_, self._socket = self._socket, None
+        if socket_ is not None:
+            try:
+                socket_.sock.close()
+            except OSError:
+                pass
+
     def _call(self, method: str, params: dict[str, Any]) -> Any:
         with self._lock:
             if self._socket is None:
                 self._socket = WebSocket(self._websocket_url(), self.timeout)
             self._next_id += 1
             identifier = self._next_id
-            self._socket.send(
-                json.dumps(
-                    {"id": identifier, "method": method, "params": params}
-                ).encode()
-            )
-            while True:
-                message = json.loads(self._socket.receive())
-                if message.get("id") != identifier:
-                    continue
-                if "error" in message:
-                    raise ProtocolError(
-                        message["error"].get("message", str(message["error"]))
-                    )
-                return message.get("result")
+            # A transport failure must not leave the dead socket in place, or
+            # every later call reuses it and the adapter stays broken for the
+            # rest of the process. A CDP method error is not a transport
+            # failure, so it is raised below without discarding the connection.
+            try:
+                self._socket.send(
+                    json.dumps(
+                        {"id": identifier, "method": method, "params": params}
+                    ).encode()
+                )
+                while True:
+                    message = json.loads(self._socket.receive())
+                    if message.get("id") == identifier:
+                        break
+            except (OSError, ProtocolError):
+                self._drop_socket()
+                raise
+            if "error" in message:
+                raise ProtocolError(
+                    message["error"].get("message", str(message["error"]))
+                )
+            return message.get("result")
 
     async def surface_session(self) -> str:
         if configured := self.config.get("session_id"):
@@ -275,10 +314,7 @@ class CDPAdapter(Adapter):
             await self.browser("Input.insertText", {"text": text})
             return {"characters": len(text)}
         if action in {"key", "hotkey"}:
-            values = params.get("keys", params.get("key"))
-            values = [values] if isinstance(values, str) else values
-            if not isinstance(values, list):
-                raise ActionError("key action requires a key string or list")
+            values = key_expressions(params)
             for expression in values:
                 parts = str(expression).split("+")
                 modifiers = 0
@@ -303,14 +339,31 @@ class CDPAdapter(Adapter):
                     "shift": "Shift",
                     "meta": "Meta",
                     "space": " ",
+                    "tab": "Tab",
+                    "home": "Home",
+                    "end": "End",
+                    "insert": "Insert",
+                    "page_up": "PageUp",
+                    "pageup": "PageUp",
+                    "page_down": "PageDown",
+                    "pagedown": "PageDown",
+                    "up": "ArrowUp",
+                    "down": "ArrowDown",
+                    "left": "ArrowLeft",
+                    "right": "ArrowRight",
+                    "caps_lock": "CapsLock",
+                    "super": "Meta",
                 }.get(raw_key.casefold(), raw_key)
+                event: dict[str, Any] = {"key": key, "modifiers": modifiers}
+                if (code := _CDP_VIRTUAL_KEYS.get(key)) is not None:
+                    event["windowsVirtualKeyCode"] = code
+                    event["nativeVirtualKeyCode"] = code
                 await self.browser(
                     "Input.dispatchKeyEvent",
-                    {"type": "keyDown", "key": key, "modifiers": modifiers},
+                    {"type": "rawKeyDown" if code is not None else "keyDown", **event},
                 )
                 await self.browser(
-                    "Input.dispatchKeyEvent",
-                    {"type": "keyUp", "key": key, "modifiers": modifiers},
+                    "Input.dispatchKeyEvent", {"type": "keyUp", **event}
                 )
             return {"keys": values}
         raise ActionError(f"unsupported CDP action: {action}")
