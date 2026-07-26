@@ -514,15 +514,29 @@ class Controller:
             # The element layer reports desktop coordinates, so an element below
             # the fold resolves to a point the pointer cannot reach. Scroll
             # toward it and ask again rather than acting on an unreachable point.
+            #
+            # Reachable means inside the window showing the element, not merely
+            # on the screen: a window shorter than the screen leaves a band
+            # where a point is numerically on the surface and physically on
+            # whatever sits beneath the window. Measured live: a field at
+            # desktop y=899 under a window ending at 890 on a 900px screen was
+            # ruled reachable and the click landed on the panel below.
             frame, _ = await self.capture(target)
+            top_bound, bottom_bound = 0, frame.height
+            try:
+                window_region = await self._window_region(target, "active")
+                top_bound = max(top_bound, int(window_region[1]))
+                bottom_bound = min(bottom_bound, int(window_region[3]))
+            except (ActionError, CapabilityError):
+                pass
             centre = int(box["top"]) + int(box["height"]) // 2
-            if 0 <= centre < frame.height:
+            if top_bound <= centre < bottom_bound:
                 break
             previous = dict(box)
             scroller = await router.select(Capability.SCROLL)
             await scroller.act(
                 "scroll",
-                {"direction": "down" if centre >= frame.height else "up", "amount": 4},
+                {"direction": "down" if centre >= bottom_bound else "up", "amount": 4},
             )
             scrolled += 1
             if not await self._await_moved(elements, query, previous, hint=hint):
