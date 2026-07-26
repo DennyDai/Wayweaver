@@ -31,6 +31,9 @@ class ATSPIAdapter(Adapter):
         self._session: ShellSession | None = None
         self._session_lock = asyncio.Lock()
         self._timeout = float(config.get("timeout", 30))
+        self._handshake_timeout = min(
+            self._timeout, float(config.get("handshake_timeout", 5))
+        )
 
     def _command(self, action: str) -> str:
         environment = linux_path_export()
@@ -56,8 +59,15 @@ class ATSPIAdapter(Adapter):
                 if session is None:
                     return None
                 try:
-                    hello = await session.banner(self._timeout)
+                    hello = await session.banner(self._handshake_timeout)
                 except (ActionError, asyncio.TimeoutError, OSError, ValueError):
+                    # Falling back to a one-shot helper is the whole point of
+                    # returning None here, so the handshake gets its own short
+                    # patience rather than the operation's. A serve process
+                    # that hangs before it can greet -- libatspi blocking on
+                    # an application that never answers -- otherwise spent the
+                    # full operation timeout on every single call before
+                    # reaching a fallback that works in well under a second.
                     await session.close()
                     return None
                 if not hello.get("ready"):

@@ -150,6 +150,19 @@ A step may be made conditional with `when`, which compares a saved result agains
 
 A skipped step is reported with `"skipped": true` rather than silently omitted.
 
+A step whose failure is itself an answer takes `optional: true`. Dismissing a dialog that may not be there is the ordinary way a task begins, and without this the whole sequence ends on the first absent dialog. An optional step that fails is recorded with `"ok": false` and the sequence continues, so a later step can branch on whether it succeeded:
+
+```json
+[
+  {"operation": "element.activate", "params": {"selector": {"name": "Close"}},
+   "optional": true, "save_as": "dismissed"},
+  {"operation": "window.focus", "params": {"selector": {"title": "Editor"}},
+   "when": {"ref": "dismissed.ok", "equals": true}}
+]
+```
+
+**Batch as much as you know.** The runner is the single largest thing you control about how long a task takes, and not because it executes faster. Measured on the same login flow, six separate calls and one sequence took the same wall clock -- 570ms against 545ms -- but the sequence is one round trip instead of six. Published measurements of computer-use agents put planning at 53-75% of total wall clock and screenshots plus action execution together at 1-3%, so the cost of a step is dominated by deciding to take it, not by taking it. Five round trips saved is five planning calls saved; the 25ms is noise. Hand over every action you can already predict, and come back only where the next move genuinely depends on what you see.
+
 Explicit steps may add bounded workflow controls: `id`, `retry` (`max_attempts` up to 10, `backoff_ms`, and optional `on_codes`), `repeat` (up to 100), `save_as`, and `when`. Retries run only for errors whose contract says `retryable: true`; `on_codes` narrows that set. A parameter object containing only `{"$ref":"saved.path"}` resolves a prior saved response before validation. Internal saved values remain complete for references, while the returned `saved` object is bounded by `saved_output_limit` (32 KiB by default).
 
 ```json
