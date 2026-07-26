@@ -11,7 +11,18 @@ from ..image import png_size
 from ..motion import trajectory
 from ..runtime import linux_path_export
 from ..types import Capability, Frame
-from .base import Adapter, require_shell_transport
+from .base import Adapter, key_expressions, require_shell_transport
+
+
+def _chord_key(key: str) -> str:
+    """Lower a bare letter inside a chord so `ctrl+A` means Ctrl+A, not Ctrl+Shift+A.
+
+    Everything else keeps its case: X11 resolves keysym names through
+    XStringToKeysym, where `Return`, `Tab`, `F4`, and `Left` are case-sensitive
+    and their lowercase spellings do not exist. Modifier aliases (`ctrl`, `alt`,
+    `shift`, `super`) are matched case-insensitively by xdotool itself.
+    """
+    return key.lower() if len(key) == 1 and key.isalpha() else key
 
 
 class X11Adapter(Adapter):
@@ -70,13 +81,19 @@ class X11Adapter(Adapter):
             f"{body}"
         )
 
-    async def _run(self, body: str, stdin: bytes | None = None) -> bytes:
+    async def _execute(
+        self, body: str, stdin: bytes | None = None
+    ) -> tuple[bytes, bytes]:
         code, stdout, stderr = await self.transport.shell(self._command(body), stdin)
         if code:
             raise ActionError(
                 stderr.decode(errors="replace").strip()
                 or f"remote command exited {code}"
             )
+        return stdout, stderr
+
+    async def _run(self, body: str, stdin: bytes | None = None) -> bytes:
+        stdout, _ = await self._execute(body, stdin)
         return stdout
 
     async def available(self) -> tuple[bool, str | None]:
@@ -93,7 +110,7 @@ class X11Adapter(Adapter):
                 "command -v wmctrl >/dev/null && "
                 "command -v xprop >/dev/null && "
                 "for tool in wmctrl xdotool xprop xrandr xwininfo wayweaver-x11-record; do "
-                'command -v "$tool" >/dev/null && printf \'%s\n\' "$tool"; done'
+                'if command -v "$tool" >/dev/null; then printf \'%s\n\' "$tool"; fi; done'
             )
             tools = set(output.decode().splitlines())
             self.capabilities = (
@@ -220,13 +237,29 @@ class X11Adapter(Adapter):
         self, params: dict[str, Any], timeout: float
     ) -> dict[str, Any]:
         deadline = time.monotonic() + max(0, timeout)
+        interval = max(0.05, float(params.get("interval", 0.2)))
+        # A dialog that is still up means the action behind it never committed,
+        # so waiting for a window to go away is as load-bearing as waiting for
+        # one to appear.
+        if params.get("absent"):
+            while True:
+                try:
+                    window = await self._window(params)
+                except ActionError:
+                    return {"absent": True}
+                if time.monotonic() >= deadline:
+                    raise ActionError(
+                        f"window still present: {window.get('title', '')!r}",
+                        details={"id": window.get("id")},
+                    )
+                await asyncio.sleep(interval)
         while True:
             try:
                 return await self._window(params)
             except ActionError:
                 if time.monotonic() >= deadline:
                     raise
-                await asyncio.sleep(max(0.05, float(params.get("interval", 0.2))))
+                await asyncio.sleep(interval)
 
     async def _window_action(
         self, action: str, params: dict[str, Any]
@@ -362,11 +395,26 @@ class X11Adapter(Adapter):
             buttons = {"up": 4, "down": 5, "left": 6, "right": 7}
             if direction not in buttons:
                 raise ActionError(f"invalid scroll direction: {direction}")
-            prefix = ""
+            # X11 delivers wheel events to the window under the pointer, not the
+            # focused one, so an unpositioned scroll silently drives whatever
+            # happens to sit beneath the cursor -- a panel, the desktop, or an
+            # unrelated window. Fall back to the active window's centre.
+            point = None
             if "x" in params and "y" in params:
-                prefix = (
-                    await self._move_script(int(params["x"]), int(params["y"])) + "; "
+                point = (int(params["x"]), int(params["y"]))
+            else:
+                active = next(
+                    (window for window in await self.windows() if window["active"]),
+                    None,
                 )
+                if active is not None:
+                    point = (
+                        active["x"] + active["width"] // 2,
+                        active["y"] + active["height"] // 2,
+                    )
+            prefix = ""
+            if point is not None:
+                prefix = await self._move_script(*point) + "; "
             amount = max(0, int(params.get("amount", 3)))
             await self._run(
                 f"{prefix}xdotool click --repeat {amount} --delay 60 {buttons[direction]}"
@@ -374,22 +422,29 @@ class X11Adapter(Adapter):
             return {"direction": direction, "amount": amount}
         if action == "type":
             text = str(params.get("text", ""))
+            # `--` keeps text that begins with a dash from being read as an
+            # xdotool option; shell quoting alone does not stop that.
             await self._run(
-                f"xdotool type --clearmodifiers --delay {int(params.get('delay_ms', 15))} {shlex.quote(text)}"
+                f"xdotool type --clearmodifiers --delay {int(params.get('delay_ms', 15))} "
+                f"-- {shlex.quote(text)}"
             )
             return {"characters": len(text)}
         if action in {"key", "hotkey"}:
-            keys = params.get("keys", params.get("key"))
-            if isinstance(keys, str):
-                keys = [keys]
-            if not isinstance(keys, list) or not all(
-                isinstance(key, str) for key in keys
-            ):
-                raise ActionError("key action requires a key string or list")
-            await self._run(
-                "xdotool key --clearmodifiers "
-                + " ".join(shlex.quote(key) for key in keys)
+            keys = key_expressions(params)
+            key_spec = "+".join(keys) if len(keys) > 1 else keys[0]
+            if "+" in key_spec:
+                key_spec = "+".join(_chord_key(key) for key in key_spec.split("+"))
+            _, stderr = await self._execute(
+                f"xdotool key --clearmodifiers {shlex.quote(key_spec)}"
             )
+            # xdotool reports an unresolvable keysym on stderr and still exits 0,
+            # which would otherwise report a keystroke that never happened.
+            message = stderr.decode(errors="replace").strip()
+            if "No such key name" in message:
+                raise ActionError(
+                    f"X11 rejected key sequence {key_spec!r}: {message}",
+                    details={"keys": keys, "key_spec": key_spec},
+                )
             return {"keys": keys}
         raise ActionError(f"unsupported X11 action: {action}")
 

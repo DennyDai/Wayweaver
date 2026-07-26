@@ -8,8 +8,16 @@ from ..image import png_size
 from ..motion import trajectory
 from ..runtime import linux_path_export
 from ..types import Capability, Frame
-from .base import Adapter, require_shell_transport
+from .base import Adapter, key_expressions, require_shell_transport
+
 from .wayland_backends import GnomeBackend, KDotoolBackend, SwayBackend
+
+
+# The canonical contract numbers buttons 1=left, 2=middle, 3=right, matching
+# xdotool. ydotool numbers them 0=left, 1=right, 2=middle, so the contract value
+# cannot be added to 0xC0 directly: doing so turned a requested left click into
+# a right click and a requested right click into an undefined button.
+_YDOTOOL_BUTTONS = {1: 0x00, 2: 0x02, 3: 0x01}
 
 
 class WaylandAdapter(Adapter):
@@ -45,6 +53,13 @@ class WaylandAdapter(Adapter):
         return (
             f'{environment}export XDG_RUNTIME_DIR="${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"; '
             'export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"; '
+            # swaymsg locates the compositor through SWAYSOCK, which a shell
+            # opened from outside the session never inherits, so sway IPC --
+            # and with it every window and workspace operation -- failed with
+            # "Unable to retrieve socket path" even on a healthy session.
+            'if [ -z "${SWAYSOCK:-}" ]; then '
+            'sway_socket=$(ls -1t "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1); '
+            '[ -n "$sway_socket" ] && export SWAYSOCK="$sway_socket"; fi; '
             f"{body}"
         )
 
@@ -68,7 +83,7 @@ class WaylandAdapter(Adapter):
                         'test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" || exit 2; '
                         "for tool in wayweaver-applications gdbus gnome-screenshot grim "
                         "kdotool spectacle swaymsg wl-copy wl-paste wtype ydotool; do "
-                        'command -v "$tool" >/dev/null && printf \'%s\\n\' "$tool"; done'
+                        'if command -v "$tool" >/dev/null; then printf \'%s\\n\' "$tool"; fi; done'
                     )
                 )
                 .decode()
@@ -169,8 +184,8 @@ class WaylandAdapter(Adapter):
             target = int(params["x"]), int(params["y"])
             await self._move(target, params.get("duration_ms"))
             if action != "move":
-                button = 1 if action == "right_click" else int(params.get("button", 0))
-                code = 0xC0 + button
+                button = 3 if action == "right_click" else int(params.get("button", 1))
+                code = 0xC0 + _YDOTOOL_BUTTONS.get(button, 0x00)
                 for _ in range(2 if action == "double_click" else 1):
                     await self._run(f"ydotool click {code:#x}")
                     await asyncio.sleep(0.12)
@@ -188,10 +203,7 @@ class WaylandAdapter(Adapter):
             await self._run("wtype -- " + shlex.quote(text))
             return {"characters": len(text)}
         if action in {"key", "hotkey"}:
-            values = params.get("keys", params.get("key"))
-            values = [values] if isinstance(values, str) else values
-            if not isinstance(values, list):
-                raise ActionError("key action requires a key string or list")
+            values = key_expressions(params)
             for expression in values:
                 parts = str(expression).split("+")
                 modifiers = parts[:-1]
@@ -319,7 +331,16 @@ class WaylandAdapter(Adapter):
             }
         if operation == "clipboard.write":
             text = str(params.get("text", ""))
-            await self._run("wl-copy", text.encode())
+            # Wayland has no clipboard manager: wl-copy must stay alive to
+            # serve the selection, and it inherits stdout, so the calling shell
+            # never sees end-of-file and the operation hangs. Detach it and
+            # close its streams so only the copy outlives the command.
+            await self._run(
+                'tmp=$(mktemp); cat > "$tmp"; '
+                "setsid sh -c 'wl-copy < \"$1\"; rm -f \"$1\"' sh \"$tmp\" "
+                "</dev/null >/dev/null 2>&1 & exit 0",
+                text.encode(),
+            )
             return {"characters": len(text)}
         return await super().perform(operation, params)
 
