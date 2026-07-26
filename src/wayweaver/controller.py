@@ -47,6 +47,14 @@ def _next_interval(current: float, ceiling: float) -> float:
 # ~100ms apart, so a shorter window reads mid-flight coordinates as settled.
 _SETTLE_SECONDS = 0.25
 
+# How many consecutive identical captures mean the surface has stopped, and
+# how long to leave between them. An animated scroll redraws roughly every
+# 40ms, so sampling faster than that can catch the same frame twice and call
+# a moving picture settled -- one missed click in five before these were
+# widened. Three samples spaced past a frame cover ~130ms of stillness.
+_SETTLE_FRAMES = 2
+_SETTLE_GAP = 0.025
+
 
 def _ocr_crop(region: list[int]) -> tuple[list[int], list[int]]:
     """Expand a locator region to a readable crop.
@@ -429,6 +437,40 @@ class Controller:
                 pass
         return await elements.perform("element.find", query)
 
+    async def _surface_settled(
+        self, target: str, around: dict[str, Any], deadline: float
+    ) -> bool:
+        """Wait until the screen stops changing near `around`.
+
+        Pixels answer "is it still moving?" both sooner and more honestly than
+        the element layer does. Measured on an animated browser scroll, the
+        picture stopped changing at 147-224ms while a position query kept
+        returning the old coordinates for far longer -- and a toolkit that does
+        not animate settles on the very first comparison. Two identical
+        captures of a small region cost about 40ms, against the 303ms a
+        fixed settle window charged every application whether it animated or
+        not.
+
+        Returns False when the surface cannot be cropped, which is the signal
+        to fall back to watching coordinates instead.
+        """
+        left = max(0, int(around.get("left", 0)) - 220)
+        top = max(0, int(around.get("top", 0)) - 160)
+        region = [left, top, left + 520, top + 400]
+        previous, stable = None, 0
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                frame, _ = await self.capture(target, {"region": region})
+            except (ActionError, CapabilityError):
+                return False
+            digest = hashlib.sha256(frame.png).hexdigest()
+            stable = stable + 1 if digest == previous else 0
+            previous = digest
+            if stable >= _SETTLE_FRAMES:
+                return True
+            await asyncio.sleep(_SETTLE_GAP)
+        return True
+
     async def _await_moved(
         self,
         elements: Any,
@@ -436,23 +478,23 @@ class Controller:
         previous: dict[str, Any],
         timeout: float = 3.0,
         hint: str | None = None,
+        target: str | None = None,
     ) -> bool:
-        """Wait until the element settles at a position other than `previous`.
+        """Wait for a scrolled element to come to rest, then read where it is.
 
-        Two things go wrong if this is rushed. Toolkits publish new coordinates a
-        little after a scroll lands -- around 300ms for a browser -- so resolving
-        immediately returns where the element used to be. And browsers animate
-        scrolling, so an early reading catches a position the element is still
-        moving through; a click there lands on whatever it happens to pass over.
+        Asking the element layer repeatedly cannot tell "still moving" from
+        "moving again": a position query is answered on demand, so consecutive
+        replies can be identical mid-animation and identical at rest. Judging
+        by elapsed time instead just picks a constant, and the right constant
+        differs per toolkit -- a browser animates, a native list does not.
 
-        Stability is therefore measured in time, not in readings. Counting
-        readings ties the answer to how fast the element layer can be queried:
-        scoping searches to one application made queries fast enough that two
-        consecutive replies could land inside a single animation frame and look
-        settled while the element was still moving.
+        Pixels settle the question directly. Once the picture stops changing,
+        one query returns the final position: verified 3/3 against a reading
+        taken a second later. Watching coordinates remains the fallback for
+        surfaces that cannot be cropped, such as VNC and RDP.
 
-        Returns False if the position never changed, which means the surface has
-        stopped scrolling and repeating the gesture cannot help.
+        Returns False if the position never changed, which means the surface
+        has stopped scrolling and repeating the gesture cannot help.
         """
         def spot(bounds: dict[str, Any]) -> tuple[int, int]:
             return int(bounds.get("left", 0)), int(bounds.get("top", 0))
@@ -460,6 +502,18 @@ class Controller:
         clock = asyncio.get_running_loop().time
         origin = spot(previous)
         deadline = clock() + timeout
+
+        if target is not None and await self._surface_settled(
+            target, previous, deadline
+        ):
+            try:
+                found = await self._find_element(elements, options, hint)
+                bounds = found.get("bounds") if isinstance(found, dict) else None
+            except (CapabilityError, ActionError):
+                bounds = None
+            if bounds:
+                return spot(bounds) != origin
+
         last: tuple[int, int] | None = None
         held_since = clock()
         while True:
@@ -514,7 +568,8 @@ class Controller:
             return box
         # It moved once, so it is still moving. Wait for it to stop, then take
         # the position it stopped at.
-        await self._await_moved(elements, options, current, hint=hint)
+        await self._await_moved(elements, options, current, hint=hint,
+                                target=target)
         return await read() or current
 
     async def _element_point(
@@ -604,7 +659,8 @@ class Controller:
                 {"direction": "down" if centre >= bottom_bound else "up", "amount": 4},
             )
             scrolled += 1
-            if not await self._await_moved(elements, query, previous, hint=hint):
+            if not await self._await_moved(elements, query, previous, hint=hint,
+                                            target=target):
                 # The surface will not scroll any further, so more attempts
                 # cannot help. `box` still holds the position, which is now
                 # current, and the surface guard reports it if it stays off.

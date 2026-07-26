@@ -483,8 +483,12 @@ class ScrollBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         controller.router = lambda target: FakeRouter()
 
+        # A real Frame: the settle check hashes frame.png, so a stand-in
+        # without one hides that path instead of exercising it.
+        frames = iter(lambda: Frame(b"same-picture", 1600, 900, "x11"), None)
+
         async def capture(target, params=None):
-            return SimpleNamespace(width=1600, height=900), "x11"
+            return next(frames), "x11"
 
         controller.capture = capture
 
