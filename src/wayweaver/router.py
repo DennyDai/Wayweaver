@@ -11,6 +11,12 @@ from .operations import API_VERSION, OPERATIONS
 from .types import Capability
 
 
+#: How stale a probe must be before a failed lookup re-runs it. Short enough
+#: that a caller waiting on a recovering adapter sees it come back, long
+#: enough that a burst of misses does not become a burst of probes.
+_REPROBE_AFTER_MISS = 1.0
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterStatus:
     name: str
@@ -96,13 +102,9 @@ class Router:
             ),
         )
 
-    async def _available(
-        self,
-        requirements: set[Capability],
-        exclude: set[str] | None = None,
+    def _pick(
+        self, requirements: set[Capability], excluded: set[str]
     ) -> Adapter | None:
-        await self._ensure_probed()
-        excluded = exclude or set()
         for adapter in self._ordered():
             status = self.status[adapter.name]
             if (
@@ -112,6 +114,27 @@ class Router:
             ):
                 return adapter
         return None
+
+    async def _available(
+        self,
+        requirements: set[Capability],
+        exclude: set[str] | None = None,
+    ) -> Adapter | None:
+        await self._ensure_probed()
+        excluded = exclude or set()
+        adapter = self._pick(requirements, excluded)
+        if adapter is not None:
+            return adapter
+        # A momentary probe failure would otherwise be cached for the whole
+        # TTL, and a caller's retries all land on the same stale snapshot --
+        # a semantic layer that dropped off its bus for a second stayed
+        # unavailable for thirty, so waiting for it could never succeed.
+        # Re-probing only once the result has some age keeps a burst of calls
+        # from turning every miss into a probe.
+        if time.monotonic() - self.probed_at >= _REPROBE_AFTER_MISS:
+            await self.probe()
+            adapter = self._pick(requirements, excluded)
+        return adapter
 
     async def operation_routes(
         self, include_raw: bool = False

@@ -27,7 +27,7 @@ from wayweaver.errors import (
     error_payload,
 )
 from wayweaver.operations import API_VERSION, OPERATIONS
-from wayweaver.router import Router
+from wayweaver.router import Router, _REPROBE_AFTER_MISS
 from wayweaver.sequence import normalize
 from wayweaver.types import Frame
 from wayweaver.types import Capability
@@ -530,6 +530,60 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
         }
         await controller.close()
         self.assertTrue(healthy.closed)
+
+
+class ProbeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """A momentary probe failure must not be cached for the whole TTL.
+
+    An adapter that dropped off its bus for a second stayed unavailable for
+    thirty, so a caller waiting on it retried against the same stale snapshot
+    and could never succeed -- observed live as element.point failing for its
+    full timeout while the accessibility layer had already recovered.
+    """
+
+    class Flaky(StubAdapter):
+        def __init__(self):
+            super().__init__("atspi", "atspi", {Capability.ELEMENTS})
+            self.healthy = False
+            self.probes = 0
+
+        async def available(self):
+            self.probes += 1
+            return self.healthy, None if self.healthy else "bus lost"
+
+    def router(self, adapter):
+        router = Router.__new__(Router)
+        router.target = TargetConfig("desktop", ("atspi",), {}, 30.0)
+        router.adapters = {adapter.name: adapter}
+        router.status = {}
+        router.probed_at = 0.0
+        return router
+
+    async def test_recovery_is_noticed_before_the_ttl_expires(self):
+        adapter = self.Flaky()
+        router = self.router(adapter)
+        self.assertIsNone(await router._available({Capability.ELEMENTS}))
+        adapter.healthy = True
+        # The TTL is 30s; without re-probing on a miss this stays None.
+        router.probed_at -= _REPROBE_AFTER_MISS + 0.1
+        found = await router._available({Capability.ELEMENTS})
+        self.assertIs(found, adapter)
+
+    async def test_a_burst_of_misses_does_not_become_a_burst_of_probes(self):
+        adapter = self.Flaky()
+        router = self.router(adapter)
+        for _ in range(5):
+            self.assertIsNone(await router._available({Capability.ELEMENTS}))
+        # One initial probe plus at most one re-probe for the whole burst.
+        self.assertLessEqual(adapter.probes, 2)
+
+    async def test_a_healthy_adapter_is_never_re_probed(self):
+        adapter = self.Flaky()
+        adapter.healthy = True
+        router = self.router(adapter)
+        for _ in range(4):
+            await router._available({Capability.ELEMENTS})
+        self.assertEqual(adapter.probes, 1)
 
 
 class ElementSearchScopeTests(unittest.IsolatedAsyncioTestCase):
