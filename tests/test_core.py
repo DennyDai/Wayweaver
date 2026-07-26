@@ -772,3 +772,85 @@ class WindowGeometryTests(unittest.IsolatedAsyncioTestCase):
             "0xaa 1,2,3,4\n0xbb not-numbers\n0xcc 1,2\nnoid\n0xdd 9,8,7,6\n"
         )
         self.assertEqual(parsed, {"0xaa": (1, 3), "0xdd": (9, 7)})
+
+
+class OptionalStepTests(unittest.IsolatedAsyncioTestCase):
+    """A step whose failure is an answer must not end the sequence.
+
+    Dismissing a dialog that may not be there is the ordinary way a task
+    begins. Without this the whole sequence ends on the first absent dialog,
+    which is why such openings had to stay outside the runner -- and every
+    step left outside it is another round trip the agent pays for.
+    """
+
+    class Recorder:
+        def __init__(self, failing):
+            self.failing = failing
+            self.performed = []
+
+        async def perform(self, target, operation, params=None):
+            self.performed.append(operation)
+            if operation in self.failing:
+                from wayweaver.errors import ActionError
+
+                raise ActionError(f"{operation} found nothing")
+            return {"ok": True, "operation": operation, "data": {}}
+
+        async def observe(self, target, ocr=False):
+            return {}
+
+    async def execute(self, steps, failing=()):
+        from wayweaver.sequence import run_sequence
+
+        controller = self.Recorder(set(failing))
+        result = await run_sequence(controller, "desktop", steps, on_error="stop")
+        return result, controller
+
+    async def test_an_optional_failure_lets_the_rest_run(self):
+        result, controller = await self.execute(
+            [
+                {"operation": "element.activate",
+                 "params": {"selector": {"name": "Close"}}, "optional": True},
+                {"operation": "window.list", "params": {}},
+            ],
+            failing={"element.activate"},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(controller.performed, ["element.activate", "window.list"])
+        self.assertFalse(result["completed"][0]["ok"])
+        self.assertTrue(result["completed"][0]["optional"])
+
+    async def test_a_required_failure_still_stops(self):
+        result, controller = await self.execute(
+            [
+                {"operation": "element.activate",
+                 "params": {"selector": {"name": "Close"}}},
+                {"operation": "window.list", "params": {}},
+            ],
+            failing={"element.activate"},
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(controller.performed, ["element.activate"])
+
+    async def test_a_later_step_can_branch_on_the_outcome(self):
+        result, controller = await self.execute(
+            [
+                {"operation": "element.activate",
+                 "params": {"selector": {"name": "Close"}},
+                 "optional": True, "save_as": "dismissed"},
+                {"operation": "window.list", "params": {},
+                 "when": {"ref": "dismissed.ok", "equals": True}},
+                {"operation": "screen.observe", "params": {}},
+            ],
+            failing={"element.activate"},
+        )
+        self.assertTrue(result["ok"])
+        # window.list was skipped because the dialog was never there.
+        self.assertEqual(controller.performed, ["element.activate", "screen.observe"])
+        self.assertTrue(result["completed"][1]["skipped"])
+
+    def test_optional_must_be_a_boolean(self):
+        from wayweaver.sequence import _options
+
+        with self.assertRaises(ValueError):
+            _options({"operation": "window.list", "optional": "yes"})

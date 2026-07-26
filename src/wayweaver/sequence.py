@@ -16,6 +16,7 @@ _STEP_FIELDS = {
     "repeat",
     "save_as",
     "when",
+    "optional",
 }
 _VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -128,6 +129,7 @@ def _options(step: dict[str, Any]) -> dict[str, Any]:
             "repeat": 1,
             "save_as": None,
             "when": None,
+            "optional": False,
         }
     step_id = step.get("id")
     if step_id is not None and (
@@ -163,6 +165,9 @@ def _options(step: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("retry.backoff_ms must be between 0 and 60000")
     if not isinstance(repeat, int) or not 1 <= repeat <= 100:
         raise ValueError("repeat must be between 1 and 100")
+    optional = step.get("optional", False)
+    if not isinstance(optional, bool):
+        raise ValueError("optional must be a boolean")
     when = step.get("when")
     if when is not None and (
         not isinstance(when, dict)
@@ -178,6 +183,7 @@ def _options(step: dict[str, Any]) -> dict[str, Any]:
         "repeat": repeat,
         "save_as": save_as,
         "when": when,
+        "optional": optional,
     }
 
 
@@ -240,6 +246,7 @@ async def run_sequence(
             executions = []
             for repeat_index in range(options["repeat"]):
                 params = _resolve(raw_params, saved)
+                failure = None
                 for attempts in range(1, options["max_attempts"] + 1):
                     try:
                         response = await controller.perform(target, operation, params)
@@ -250,9 +257,23 @@ async def run_sequence(
                             allowed_codes is None or error.code in allowed_codes
                         )
                         if not should_retry or attempts >= options["max_attempts"]:
-                            raise
+                            # An optional step is one whose failure is an
+                            # answer: dismissing a dialog that may not be
+                            # there is the ordinary way a task begins, and
+                            # without this the whole sequence ends on it.
+                            if not options["optional"]:
+                                raise
+                            failure = error
+                            break
                         if options["backoff_ms"]:
                             await asyncio.sleep(options["backoff_ms"] / 1000)
+                if failure is not None:
+                    response = {
+                        "ok": False,
+                        "operation": operation,
+                        "optional": True,
+                        "error": error_payload(failure),
+                    }
                 entry = {"step": index, **response, "attempts": attempts}
                 if options["id"]:
                     entry["id"] = options["id"]
@@ -260,6 +281,8 @@ async def run_sequence(
                     entry["repeat_index"] = repeat_index
                 completed.append(entry)
                 executions.append(response)
+                if failure is not None:
+                    break
             if options["save_as"]:
                 saved[options["save_as"]] = (
                     executions[0] if len(executions) == 1 else executions
