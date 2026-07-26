@@ -220,8 +220,14 @@ def _canonical_key(value: str) -> str:
 def prepare_params(operation: str, params: dict[str, Any]) -> dict[str, Any]:
     prepared = deepcopy(params)
     selector = prepared.pop("selector", None)
-    if selector:
+    if isinstance(selector, dict):
         prepared.update(selector)
+    elif selector:
+        # The browser operations take a CSS selector, which the schema says is
+        # a string. Flattening it as if it were a mapping raised a bare
+        # ValueError from inside preparation -- so browser.click, whose
+        # selector is required, could never run at all.
+        prepared["selector"] = selector
     expected = prepared.pop("expect", None)
     if expected:
         prepared.update(expected)

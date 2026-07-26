@@ -854,3 +854,41 @@ class OptionalStepTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             _options({"operation": "window.list", "optional": "yes"})
+
+
+class StringSelectorTests(unittest.TestCase):
+    """A CSS selector is a string, and preparation must not flatten it.
+
+    The browser operations declare `selector` as a string in their schema,
+    while preparation spread every selector as if it were a mapping. That
+    raised a bare ValueError from inside the contract layer, so browser.click
+    -- whose selector is required -- could never run at all.
+    """
+
+    def test_a_string_selector_survives_preparation(self):
+        from wayweaver.contracts import prepare_params
+
+        prepared = prepare_params("browser.click", {"selector": "button.radius"})
+        self.assertEqual(prepared["selector"], "button.radius")
+
+    def test_a_mapping_selector_is_still_flattened(self):
+        from wayweaver.contracts import prepare_params
+
+        prepared = prepare_params(
+            "element.find", {"selector": {"name": "Save", "role": "button"}}
+        )
+        self.assertEqual(prepared["name"], "Save")
+        self.assertEqual(prepared["role"], "button")
+        self.assertNotIn("selector", prepared)
+
+    def test_both_browser_operations_accept_their_schema(self):
+        from wayweaver.contracts import prepare_params, validate_params
+        from wayweaver.operations import OPERATIONS
+
+        for name in ("browser.read", "browser.click"):
+            spec = OPERATIONS[name]
+            params = {"selector": "#main .item"}
+            validated = validate_params(name, spec.params_schema, params)
+            self.assertEqual(
+                prepare_params(name, validated)["selector"], "#main .item"
+            )
