@@ -279,6 +279,65 @@ class CDPTransportTests(unittest.TestCase):
         self.assertEqual(adapter._call("Runtime.evaluate", {}), {"value": 7})
 
 
+class ElementPointTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """element.point must honor the timeout its contract always accepted.
+
+    The schema admitted timeout_ms and the implementation ignored it, so a
+    resolve issued right after a navigation failed on a form that
+    legitimately did not exist yet, and every caller grew its own retry loop.
+    """
+
+    def controller(self, appears_after):
+        from wayweaver.controller import Controller
+
+        controller = Controller.__new__(Controller)
+
+        class Elements:
+            name = "atspi"
+
+            def __init__(self):
+                self.queries = 0
+
+            async def perform(self, _operation, _params):
+                self.queries += 1
+                if self.queries <= appears_after:
+                    raise ActionError("accessible element not found")
+                return {"bounds": {"left": 100, "top": 200,
+                                   "width": 50, "height": 20}}
+
+        elements = Elements()
+
+        class FakeRouter:
+            async def select(self, _requirement):
+                return elements
+
+        controller.router = lambda target: FakeRouter()
+
+        async def capture(target, params=None):
+            return SimpleNamespace(width=1600, height=900), "x11"
+
+        controller.capture = capture
+
+        async def hint(target):
+            return None
+
+        controller._application_hint = hint
+        return controller, elements
+
+    async def test_resolution_retries_until_the_element_exists(self):
+        controller, elements = self.controller(appears_after=3)
+        result = await controller._element_point(
+            "desktop", {"timeout": 5, "interval": 0.05}, allow_fallback=False
+        )
+        self.assertEqual(result["tier"], "semantic")
+        self.assertGreater(elements.queries, 3)
+
+    async def test_without_a_timeout_one_miss_is_final(self):
+        controller, elements = self.controller(appears_after=1)
+        with self.assertRaises(CapabilityError):
+            await controller._element_point("desktop", {}, allow_fallback=False)
+
+
 class ScrollBoundaryTests(unittest.IsolatedAsyncioTestCase):
     """Reachable means inside the window showing the element, not on the screen.
 

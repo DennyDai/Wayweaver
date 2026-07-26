@@ -484,6 +484,12 @@ class Controller:
         input. This resolves the target through the richest layer available and
         hands back a point any pointer adapter can use, naming the layer that
         answered so a caller can tell semantic truth from a pixel guess.
+
+        `timeout` keeps resolution retrying until the deadline. The contract
+        always accepted it -- every element operation shares the schema -- but
+        it was silently ignored here, so a resolve issued right after a
+        navigation failed on a form that legitimately did not exist yet, and
+        every caller grew its own retry loop.
         """
         router = self.router(target)
         source = tier = None
@@ -492,6 +498,12 @@ class Controller:
         scroll_budget = int(options.get("scroll", 0) or 0)
         scrolled = 0
         query = dict(options)
+        # `options` stays intact: the OCR fallback below re-reads the same
+        # timeout, so each layer gets the budget the caller named.
+        deadline = time.monotonic() + max(0.0, float(options.get("timeout", 0) or 0))
+        interval = max(0.05, float(options.get("interval", 0.4)))
+        query.pop("timeout", None)
+        query.pop("interval", None)
         hint = await self._application_hint(target)
         elements: Any = None
         while True:
@@ -509,6 +521,9 @@ class Controller:
                     }
             except (CapabilityError, ActionError):
                 box = None
+            if box is None and time.monotonic() < deadline:
+                await asyncio.sleep(interval)
+                continue
             if box is None or scrolled >= scroll_budget:
                 break
             # The element layer reports desktop coordinates, so an element below
