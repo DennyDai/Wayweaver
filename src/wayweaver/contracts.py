@@ -76,7 +76,7 @@ WINDOW_SELECTOR_SCHEMA = object_schema(
         {"required": ["pid"]},
     ),
 )
-WINDOW_EXPECT_SCHEMA = object_schema({"active": BOOLEAN})
+WINDOW_EXPECT_SCHEMA = object_schema({"active": BOOLEAN, "absent": BOOLEAN})
 ELEMENT_SELECTOR_SCHEMA = object_schema(
     {
         "id": NON_EMPTY_STRING,
@@ -90,8 +90,14 @@ ELEMENT_SELECTOR_SCHEMA = object_schema(
         "contains": BOOLEAN,
         "nth": NON_NEGATIVE_INTEGER,
         "region": REGION_SCHEMA,
+        "window": NON_EMPTY_STRING,
+        "application": NON_EMPTY_STRING,
+        "strict": BOOLEAN,
+        "include_offscreen": BOOLEAN,
+        "scroll": {"type": "integer", "minimum": 0, "maximum": 30},
         "fuzzy": BOOLEAN,
         "similarity": {"type": "number", "minimum": 0, "maximum": 1},
+        "full_screen_fallback": BOOLEAN,
     }
 )
 ELEMENT_SELECTOR_SCHEMA["anyOf"] = [
@@ -162,23 +168,53 @@ def _region_bounds(region: dict[str, Any]) -> list[int]:
     return [x, y, x + int(region["width"]), y + int(region["height"])]
 
 
+# Canonical key names use X11 keysym spelling, which every backend adapter
+# translates from. The set previously stopped at a dozen entries, so navigation
+# and editing keys passed through untranslated: `UP`, `HOME` and `PAGEUP` are
+# not valid keysyms and X11 silently dropped them, while CDP received DOM key
+# values it does not recognize. Anything absent here still passes through, so a
+# backend-specific keysym remains usable.
+_KEY_ALIASES = {
+    "ENTER": "Return",
+    "RETURN": "Return",
+    "ESC": "Escape",
+    "ESCAPE": "Escape",
+    "CTRL": "ctrl",
+    "CONTROL": "ctrl",
+    "ALT": "alt",
+    "SHIFT": "shift",
+    "META": "meta",
+    "SUPER": "super",
+    "WIN": "super",
+    "SPACE": "space",
+    "BACKSPACE": "BackSpace",
+    "BKSP": "BackSpace",
+    "DELETE": "Delete",
+    "DEL": "Delete",
+    "TAB": "Tab",
+    "INSERT": "Insert",
+    "INS": "Insert",
+    "HOME": "Home",
+    "END": "End",
+    "PAGEUP": "Page_Up",
+    "PAGE_UP": "Page_Up",
+    "PGUP": "Page_Up",
+    "PAGEDOWN": "Page_Down",
+    "PAGE_DOWN": "Page_Down",
+    "PGDN": "Page_Down",
+    "UP": "Up",
+    "DOWN": "Down",
+    "LEFT": "Left",
+    "RIGHT": "Right",
+    "MENU": "Menu",
+    "PRINTSCREEN": "Print",
+    "CAPSLOCK": "Caps_Lock",
+}
+_KEY_ALIASES.update({f"F{index}": f"F{index}" for index in range(1, 25)})
+
+
 def _canonical_key(value: str) -> str:
-    aliases = {
-        "ENTER": "Return",
-        "ESC": "Escape",
-        "ESCAPE": "Escape",
-        "CTRL": "ctrl",
-        "CONTROL": "ctrl",
-        "ALT": "alt",
-        "SHIFT": "shift",
-        "META": "meta",
-        "SUPER": "super",
-        "SPACE": "space",
-        "BACKSPACE": "BackSpace",
-        "DELETE": "Delete",
-        "TAB": "Tab",
-    }
-    return aliases.get(value.upper(), value)
+    return _KEY_ALIASES.get(value.upper(), value)
 
 
 def prepare_params(operation: str, params: dict[str, Any]) -> dict[str, Any]:

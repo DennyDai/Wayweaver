@@ -89,6 +89,22 @@ ELEMENT_TARGET_PROPERTIES = {
     "selector": ELEMENT_SELECTOR_SCHEMA,
     "expect": ELEMENT_EXPECT_SCHEMA,
     **TIME_PROPERTIES,
+    "allow_fallback": BOOLEAN,
+}
+ACTIVATION_VERIFY_SCHEMA = object_schema(
+    {
+        "surface_changed": BOOLEAN,
+        "text_disappeared": NON_EMPTY_STRING,
+        **TIME_PROPERTIES,
+    },
+    any_of=(
+        {"required": ["surface_changed"]},
+        {"required": ["text_disappeared"]},
+    ),
+)
+ELEMENT_ACTIVATE_PROPERTIES = {
+    **ELEMENT_TARGET_PROPERTIES,
+    "verify": ACTIVATION_VERIFY_SCHEMA,
 }
 POINTER_CONTEXT_PROPERTIES = {
     **COORDINATE_PROPERTIES,
@@ -103,7 +119,8 @@ CLICK_RESULT = object_schema(
     required=("x", "y", "action"),
 )
 TYPE_RESULT = object_schema(
-    {"characters": NON_NEGATIVE_INTEGER}, required=("characters",)
+    {"characters": NON_NEGATIVE_INTEGER, "verification": {"type": "object"}},
+    required=("characters",),
 )
 DRAG_RESULT = object_schema(
     {
@@ -134,6 +151,10 @@ KEY_RESULT = object_schema(
     required=("keys",),
 )
 TEXT_RESULT = object_schema({"text": STRING}, required=("text",))
+COPY_RESULT = object_schema(
+    {"text": STRING, "characters": NON_NEGATIVE_INTEGER},
+    required=("text", "characters"),
+)
 CLICKED_RESULT = object_schema({"clicked": BOOLEAN}, required=("clicked",))
 APPLICATION_LIST_RESULT = object_schema(
     {"applications": {"type": "array", "items": {"type": "object"}}},
@@ -175,6 +196,51 @@ TAB_LIST_RESULT = object_schema(
     {"tabs": {"type": "array", "items": {"type": "object"}}},
     required=("tabs",),
 )
+ELEMENT_POINT_RESULT = {
+    "type": "object",
+    "properties": {
+        "point": POINT_SCHEMA,
+        "box": object_schema(
+            {
+                "left": {"type": "integer"},
+                "top": {"type": "integer"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+            },
+            required=("left", "top", "width", "height"),
+        ),
+        "source": NON_EMPTY_STRING,
+        "tier": {"enum": ["semantic", "visual"]},
+        "surface": object_schema(
+            {
+                "adapter": NON_EMPTY_STRING,
+                "width": POSITIVE_INTEGER,
+                "height": POSITIVE_INTEGER,
+            },
+            required=("adapter", "width", "height"),
+        ),
+    },
+    "required": ["point", "box", "source", "tier", "surface"],
+}
+OCR_ITEM_RESULT = object_schema(
+    {
+        "text": NON_EMPTY_STRING,
+        "confidence": NUMBER,
+        "point": POINT_SCHEMA,
+        "box": object_schema(
+            {
+                "left": {"type": "integer"},
+                "top": {"type": "integer"},
+                "width": POSITIVE_INTEGER,
+                "height": POSITIVE_INTEGER,
+            },
+            required=("left", "top", "width", "height"),
+        ),
+    },
+    required=("text", "confidence", "point", "box"),
+)
+
+
 OBSERVE_RESULT = object_schema(
     {
         "observation_id": NON_EMPTY_STRING,
@@ -204,6 +270,7 @@ OBSERVE_RESULT = object_schema(
         "screenshot": NON_EMPTY_STRING,
         "windows": {"type": "array", "items": {"type": "object"}},
         "ocr": STRING,
+        "ocr_items": {"type": "array", "items": OCR_ITEM_RESULT},
     },
     required=("observation_id", "target", "surface", "screenshot"),
 )
@@ -272,6 +339,11 @@ _SPECS = (
             {
                 "selector": {"title": "Visual Studio Code"},
                 "expect": {"active": True},
+                "timeout_ms": 5000,
+            },
+            {
+                "selector": {"title": "Create New Folder"},
+                "expect": {"absent": True},
                 "timeout_ms": 5000,
             },
         ),
@@ -382,6 +454,20 @@ _SPECS = (
         result=TYPE_RESULT,
     ),
     _spec(
+        "clipboard.copy",
+        "Copy the focused selection and return its exact text",
+        (Capability.CLIPBOARD, Capability.KEYBOARD),
+        params=object_schema(
+            {
+                "select_all": BOOLEAN,
+                "settle_ms": NON_NEGATIVE_INTEGER,
+                "restore": BOOLEAN,
+            }
+        ),
+        result=COPY_RESULT,
+        examples=({"select_all": True},),
+    ),
+    _spec(
         "element.list",
         "List accessible interface elements",
         Capability.ELEMENTS,
@@ -401,6 +487,27 @@ _SPECS = (
         params=object_schema(ELEMENT_TARGET_PROPERTIES, required=("selector",)),
         examples=({"selector": {"name": "Save", "role": "button"}},),
         fallback=(Capability.CAPTURE,),
+    ),
+    _spec(
+        "element.focused",
+        "Describe the element that currently holds keyboard focus",
+        Capability.ELEMENTS,
+        params=object_schema({"max_depth": POSITIVE_INTEGER}),
+        examples=({},),
+    ),
+    _spec(
+        "element.point",
+        "Resolve an element to an actionable point through the richest layer available",
+        Capability.ELEMENTS,
+        params=object_schema(ELEMENT_TARGET_PROPERTIES, required=("selector",)),
+        result=ELEMENT_POINT_RESULT,
+        fallback=(Capability.CAPTURE,),
+        examples=(
+            {
+                "selector": {"name": "Save", "role": "push button"},
+                "allow_fallback": False,
+            },
+        ),
     ),
     _spec(
         "element.assert",
@@ -426,7 +533,12 @@ _SPECS = (
             f"element.{verb}",
             description,
             Capability.ELEMENTS,
-            params=object_schema(ELEMENT_TARGET_PROPERTIES, required=("selector",)),
+            params=object_schema(
+                ELEMENT_ACTIVATE_PROPERTIES
+                if verb == "activate"
+                else ELEMENT_TARGET_PROPERTIES,
+                required=("selector",),
+            ),
             fallback=(Capability.CAPTURE, Capability.POINTER)
             if verb == "activate"
             else (),
@@ -523,7 +635,12 @@ _SPECS = (
         Capability.KEYBOARD,
         tier="visual",
         params=object_schema(
-            {"text": STRING, "interval_ms": NON_NEGATIVE_INTEGER}, required=("text",)
+            {
+                "text": STRING,
+                "interval_ms": NON_NEGATIVE_INTEGER,
+                "verify": BOOLEAN,
+            },
+            required=("text",),
         ),
         result=TYPE_RESULT,
         examples=({"text": "hello", "interval_ms": 15},),

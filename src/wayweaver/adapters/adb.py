@@ -5,7 +5,7 @@ from typing import Any
 from ..errors import ActionError
 from ..image import png_size
 from ..types import Capability, Frame
-from .base import Adapter
+from .base import Adapter, key_expressions
 from .android_ui import AndroidUI
 
 _KEYEVENTS = {
@@ -23,7 +23,13 @@ _KEYEVENTS = {
     "left": "KEYCODE_DPAD_LEFT",
     "right": "KEYCODE_DPAD_RIGHT",
     "pageup": "KEYCODE_PAGE_UP",
+    "page_up": "KEYCODE_PAGE_UP",
     "pagedown": "KEYCODE_PAGE_DOWN",
+    "page_down": "KEYCODE_PAGE_DOWN",
+    "end": "KEYCODE_MOVE_END",
+    "insert": "KEYCODE_INSERT",
+    "menu": "KEYCODE_MENU",
+    **{f"f{index}": f"KEYCODE_F{index}" for index in range(1, 13)},
 }
 
 
@@ -143,10 +149,7 @@ class ADBAdapter(Adapter):
             await self._checked("shell", "input", "text", encoded)
             return {"characters": len(text)}
         if action in {"key", "hotkey"}:
-            keys = params.get("keys", params.get("key"))
-            keys = [keys] if isinstance(keys, str) else keys
-            if not isinstance(keys, list):
-                raise ActionError("key action requires a key string or list")
+            keys = key_expressions(params)
             for key in keys:
                 event = _KEYEVENTS.get(str(key).casefold(), str(key))
                 await self._checked("shell", "input", "keyevent", event)

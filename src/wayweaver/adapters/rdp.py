@@ -5,7 +5,7 @@ from typing import Any
 from ..errors import ActionError
 from ..motion import trajectory
 from ..types import Capability, Frame
-from .base import Adapter
+from .base import Adapter, key_expressions
 
 _VIRTUAL_KEYS = {
     "backspace": "VK_BACK",
@@ -18,7 +18,13 @@ _VIRTUAL_KEYS = {
     "home": "VK_HOME",
     "end": "VK_END",
     "pageup": "VK_PRIOR",
+    "page_up": "VK_PRIOR",
     "pagedown": "VK_NEXT",
+    "page_down": "VK_NEXT",
+    "caps_lock": "VK_CAPITAL",
+    "print": "VK_SNAPSHOT",
+    "menu": "VK_APPS",
+    "super": "VK_LWIN",
     "left": "VK_LEFT",
     "up": "VK_UP",
     "right": "VK_RIGHT",
@@ -28,6 +34,7 @@ _VIRTUAL_KEYS = {
     "alt": "VK_MENU",
     "shift": "VK_SHIFT",
     "space": "VK_SPACE",
+    **{f"f{index}": f"VK_F{index}" for index in range(1, 25)},
 }
 
 
@@ -215,10 +222,7 @@ class RDPAdapter(Adapter):
                     await self._key(connection, character, False)
                 return {"characters": len(text)}
             if action in {"key", "hotkey"}:
-                values = params.get("keys", params.get("key"))
-                values = [values] if isinstance(values, str) else values
-                if not isinstance(values, list):
-                    raise ActionError("key action requires a key string or list")
+                values = key_expressions(params)
                 for expression in values:
                     parts = str(expression).split("+")
                     for part in parts:

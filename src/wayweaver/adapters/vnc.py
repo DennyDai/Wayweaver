@@ -9,7 +9,7 @@ from ..errors import ActionError, ProtocolError
 from ..image import encode_png
 from ..motion import trajectory
 from ..types import Capability, Frame
-from .base import Adapter
+from .base import Adapter, key_expressions
 
 _KEYSYMS = {
     "backspace": 0xFF08,
@@ -24,7 +24,9 @@ _KEYSYMS = {
     "right": 0xFF53,
     "down": 0xFF54,
     "pageup": 0xFF55,
+    "page_up": 0xFF55,
     "pagedown": 0xFF56,
+    "page_down": 0xFF56,
     "end": 0xFF57,
     "insert": 0xFF63,
     "shift": 0xFFE1,
@@ -34,6 +36,10 @@ _KEYSYMS = {
     "meta": 0xFFE7,
     "super": 0xFFEB,
     "space": 0x20,
+    "caps_lock": 0xFFE5,
+    "print": 0xFF61,
+    "menu": 0xFF67,
+    **{f"f{index}": 0xFFBE + index - 1 for index in range(1, 13)},
 }
 
 
@@ -308,10 +314,7 @@ class VNCAdapter(Adapter):
                     connection.key(keysym, False)
                 return {"characters": len(text)}
             if action in {"key", "hotkey"}:
-                values = params.get("keys", params.get("key"))
-                values = [values] if isinstance(values, str) else values
-                if not isinstance(values, list):
-                    raise ActionError("key action requires a key string or list")
+                values = key_expressions(params)
                 for expression in values:
                     parts = expression.split("+")
                     keysyms = [self._keysym(part) for part in parts]
