@@ -244,3 +244,59 @@ class OffScreenRankingTests(unittest.TestCase):
             {"name": "Username", "include_offscreen": True},
         )
         self.assertEqual(described["bounds"]["top"], 300)
+
+
+class StrictSelectorTests(unittest.TestCase):
+    """An ambiguous selector must be refusable.
+
+    A browser exposes every tab's elements, not just the visible one, so the
+    same name resolves to a control on a page nobody can see. Its coordinates
+    are real and land on whatever is actually in front: observed live as a
+    click on an advertisement iframe while the intended field sat elsewhere.
+    """
+
+    SCREEN = (1600, 900)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.helper = load_helper()
+
+    def setUp(self):
+        self._screen_size = self.helper.screen_size
+        self.helper.screen_size = lambda: self.SCREEN
+        self.addCleanup(setattr, self.helper, "screen_size", self._screen_size)
+
+    def desktop(self, *extents):
+        return FakeNode(children=[
+            PlacedNode("Username", extents=Extents(*values)) for values in extents
+        ])
+
+    def find(self, desktop, options):
+        return self.helper.find(FakePyatspi(desktop), options)
+
+    def test_two_matches_are_refused_under_strict(self):
+        desktop = self.desktop((325, 382, 470, 33), (580, 500, 366, 39))
+        with self.assertRaises(ValueError) as caught:
+            self.find(desktop, {"name": "Username", "strict": True})
+        self.assertIn("ambiguous", str(caught.exception))
+        self.assertIn("2 matches", str(caught.exception))
+
+    def test_one_match_still_resolves(self):
+        desktop = self.desktop((580, 500, 366, 39))
+        _node, described, count = self.find(
+            desktop, {"name": "Username", "strict": True}
+        )
+        self.assertEqual(described["bounds"]["top"], 500)
+        self.assertEqual(count, 1)
+
+    def test_an_explicit_nth_opts_out_of_the_refusal(self):
+        desktop = self.desktop((325, 382, 470, 33), (580, 500, 366, 39))
+        _node, described, _count = self.find(
+            desktop, {"name": "Username", "strict": True, "nth": 1}
+        )
+        self.assertEqual(described["bounds"]["top"], 500)
+
+    def test_without_strict_the_first_match_wins_as_before(self):
+        desktop = self.desktop((325, 382, 470, 33), (580, 500, 366, 39))
+        _node, described, _count = self.find(desktop, {"name": "Username"})
+        self.assertEqual(described["bounds"]["top"], 382)

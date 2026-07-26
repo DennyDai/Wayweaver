@@ -281,6 +281,10 @@ def find(pyatspi, options):
     # here rather than making the caller ask twice matters: a search that
     # matches nothing walks the whole desktop and costs ~60x one that hits.
     include_offscreen = bool(options.get("include_offscreen", False))
+    # `strict` stops at the first duplicate rather than at the limit, so an
+    # ambiguous selector can be refused instead of silently resolved.
+    strict = bool(options.get("strict", False))
+    scan_limit = limit + 1 if strict else limit
     offscreen = []
     for node, path in stream:
         if matches(node, options):
@@ -289,13 +293,22 @@ def find(pyatspi, options):
                     offscreen.append((node, path))
                 continue
             found.append((node, path))
-            if len(found) >= limit:
+            if len(found) >= scan_limit:
                 break
-    found.extend(offscreen[: max(0, limit - len(found))])
+    found.extend(offscreen[: max(0, scan_limit - len(found))])
     nth = requested_nth
     nth = nth if nth >= 0 else len(found) + nth
     if not 0 <= nth < len(found):
         raise ValueError(f"accessible element not found: {options}")
+    if strict and "nth" not in options and len(found) > 1:
+        # A browser exposes every tab's elements, not just the visible one, so
+        # the same name can resolve to a control on a page nobody can see --
+        # the coordinates are real and land on whatever is actually in front.
+        # Picking the first is how that becomes a click somewhere unrelated.
+        raise ValueError(
+            f"ambiguous accessible selector {options}: {len(found)} matches; "
+            "narrow it with application, nth, or a more specific role"
+        )
     node, path = found[nth]
     return node, describe(pyatspi, node, path), len(found)
 
