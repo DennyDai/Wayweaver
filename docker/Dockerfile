@@ -23,6 +23,7 @@ RUN if [[ "${TARGETARCH}" != "amd64" ]]; then \
       fonts-liberation \
       git \
       jq \
+      libatk-wrapper-java-jni \
       less \
       locales \
       maim \
@@ -64,6 +65,20 @@ RUN if [[ "${TARGETARCH}" != "amd64" ]]; then \
  && locale-gen en_US.UTF-8 \
  && rm -rf /var/lib/apt/lists/*
 
+# Chrome's save-password bubble and first-run promos steal focus and cover the
+# page mid-flow, which stalls automation on an unrelated modal. Policy disables
+# them for every profile in the image.
+RUN mkdir -p /etc/opt/chrome/policies/managed \
+ && printf '%s\n' \
+      '{' \
+      '  "PasswordManagerEnabled": false,' \
+      '  "AutofillAddressEnabled": false,' \
+      '  "AutofillCreditCardEnabled": false,' \
+      '  "PromotionalTabsEnabled": false,' \
+      '  "DefaultBrowserSettingEnabled": false' \
+      '}' \
+      > /etc/opt/chrome/policies/managed/wayweaver.json
+
 RUN groupmod --new-name vm ubuntu \
  && groupmod --gid "${VM_GID}" vm \
  && usermod --login vm --uid "${VM_UID}" --gid "${VM_GID}" --home /home/vm --move-home --shell /bin/bash ubuntu \
@@ -82,6 +97,7 @@ RUN groupmod --new-name vm ubuntu \
 
 COPY docker/chrome /usr/local/bin/chrome
 COPY docker/start-desktop /usr/local/bin/start-desktop
+COPY docker/enable-accessibility /usr/local/bin/enable-accessibility
 COPY docker/start-chrome /usr/local/bin/start-chrome
 COPY src/wayweaver/_version.py /tmp/wayweaver-version.py
 COPY src/wayweaver/runtime/assets/linux/ /tmp/wayweaver-runtime/
@@ -104,6 +120,7 @@ RUN version="$(python3 -c 'scope={}; exec(open("/tmp/wayweaver-version.py").read
  && chmod 0755 \
       /usr/local/bin/chrome \
       /usr/local/bin/start-desktop \
+      /usr/local/bin/enable-accessibility \
       /usr/local/bin/start-chrome \
       /usr/local/bin/desktop-vm-entrypoint \
       /etc/profile.d/desktop-env.sh

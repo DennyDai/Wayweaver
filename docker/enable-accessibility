@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Toolkits publish their accessibility tree only while org.a11y.Status
+# IsEnabled is true, and at-spi-bus-launcher derives that from the GSettings
+# key org.gnome.desktop.interface toolkit-accessibility. Without it AT-SPI
+# reports a bare window skeleton and semantic element lookups silently degrade
+# to OCR.
+#
+# xfsettingsd syncs its own accessibility state into GSettings while the
+# session comes up, so a single early write loses the race. Assert the value
+# until it stays put.
+set -uo pipefail
+
+export DISPLAY="${DISPLAY:-:1}"
+export HOME="${HOME:-/home/vm}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+read_setting() {
+  python3 -c 'from gi.repository import Gio
+print(Gio.Settings.new("org.gnome.desktop.interface").get_boolean("toolkit-accessibility"))' 2>/dev/null
+}
+
+write_setting() {
+  python3 -c 'from gi.repository import Gio
+settings = Gio.Settings.new("org.gnome.desktop.interface")
+settings.set_boolean("toolkit-accessibility", True)
+Gio.Settings.sync()' 2>/dev/null
+}
+
+# Let the settings daemon finish its own startup sync first.
+for _ in $(seq 1 60); do
+  pgrep -x xfsettingsd >/dev/null 2>&1 && break
+  sleep 1
+done
+sleep 3
+
+settled=0
+for _ in $(seq 1 40); do
+  write_setting
+  sleep 2
+  if [[ "$(read_setting)" == "True" ]]; then
+    settled=$((settled + 1))
+    # Two consecutive confirmations mean nothing is racing us any more.
+    [[ "${settled}" -ge 2 ]] && exit 0
+  else
+    settled=0
+  fi
+done
+exit 1

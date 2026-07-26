@@ -10,4 +10,6 @@ until [[ -S /tmp/.X11-unix/X1 ]]; do
   sleep 0.2
 done
 
-exec dbus-run-session -- xfce4-session
+# enable-accessibility must run inside the session bus this creates, and it
+# outlives the exec below as its own process.
+exec dbus-run-session -- bash -c '/usr/local/bin/enable-accessibility & exec xfce4-session'

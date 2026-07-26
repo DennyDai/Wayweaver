@@ -82,8 +82,10 @@ The MCP surface is deliberately small:
 - `wayweaver_do`: perform one canonical operation.
 - `wayweaver_run`: execute an ordered canonical operation sequence locally.
 - `wayweaver_capture`: return an MCP image, optionally constrained by native region or window.
-- `wayweaver_observe`: return screen dimensions, screenshot path, OCR, and window metadata.
+- `wayweaver_observe`: return screen dimensions, screenshot path, window metadata, and optional OCR text plus structured word boxes and click points.
 - `wayweaver_raw`: execute one adapter-specific operation previously returned by `wayweaver_operations(include_raw=true)`.
+
+Text you need exactly comes from `clipboard.copy`, not from OCR; see "Reading text out of an application" below.
 
 ## CLI
 
@@ -136,6 +138,18 @@ The desktop is shared with a human. Semantic operations re-resolve applications,
 
 The runner stops at the first failure. It returns `failed_step`, the failed step, typed error, completed results, and a fresh observation by default. Correct the remaining sequence from that observation; do not replay completed non-idempotent steps.
 
+A step may be made conditional with `when`, which compares a saved result against a value and skips the step when they differ. The reference is the same dotted path `$ref` uses, so a step can act on what an earlier one observed:
+
+```json
+[
+  {"id": "state", "operation": "element.find", "params": {"selector": {"name": "Save"}}, "save_as": "save"},
+  {"operation": "element.activate", "params": {"selector": {"name": "Save"}},
+   "when": {"ref": "save.data.states.0", "equals": "enabled"}}
+]
+```
+
+A skipped step is reported with `"skipped": true` rather than silently omitted.
+
 Explicit steps may add bounded workflow controls: `id`, `retry` (`max_attempts` up to 10, `backoff_ms`, and optional `on_codes`), `repeat` (up to 100), `save_as`, and `when`. Retries run only for errors whose contract says `retryable: true`; `on_codes` narrows that set. A parameter object containing only `{"$ref":"saved.path"}` resolves a prior saved response before validation. Internal saved values remain complete for references, while the returned `saved` object is bounded by `saved_output_limit` (32 KiB by default).
 
 ```json
@@ -150,11 +164,103 @@ Explicit steps may add bounded workflow controls: `id`, `retry` (`max_attempts` 
 ]}
 ```
 
-OCR fallback selectors accept `text`, `contains`, `fuzzy`, `similarity`, `nth`, and `region`; use `timeout_ms` and `interval_ms` for bounded retries. A region is `{"x": X, "y": Y, "width": W, "height": H}` in the selected surface coordinates. Prefer native `element.*` operations whenever the control is accessible.
+OCR fallback selectors accept `text`, `contains`, `fuzzy`, `similarity`, `nth`, and `region`; use `timeout_ms` and `interval_ms` for bounded retries. A region is `{"x": X, "y": Y, "width": W, "height": H}` in the selected surface coordinates. Pass a `region` whenever you know roughly where the control is: recognizing a crop costs roughly a tenth of recognizing the whole screen, and a regional locator stays regional. Set `full_screen_fallback` to `true` to also search the rest of the screen when the region misses; surfaces that cannot crop at all, such as VNC and RDP, widen on their own. `screen.observe` with `{"ocr": true}` returns both plain `ocr` text and `ocr_items`; each item contains the recognized word, confidence, bounding box, and center point in the signed observation's coordinate space. `element.find` returns the merged match box and point, while `element.activate` clicks that point and returns `"clicked": true`. Prefer native `element.*` operations whenever the control is accessible.
 
 ```json
 {"element.activate":{"selector":{"name":"Terminal Emulator","role":"menu item","exact":true}}}
 ```
+
+For transitions that must be confirmed, add opt-in postconditions. `surface_changed` compares captures from the same adapter, while `text_disappeared` retries OCR until the label is absent or the bounded timeout expires:
+
+```json
+{"element.activate":{
+  "selector":{"text":"Finish","exact":true},
+  "verify":{
+    "surface_changed":true,
+    "text_disappeared":"New Project",
+    "timeout_ms":3000,
+    "interval_ms":250
+  }
+}}
+```
+
+## Reading text out of an application
+
+OCR is a locator, not a transcription tool. To get exact text out of a widget — a table, a decompiler pane, a log view, a long field truncated on screen — select it and use `clipboard.copy`, which returns the text verbatim:
+
+```json
+{"clipboard.copy": {"select_all": true}}
+```
+
+It poisons the clipboard with a sentinel before issuing the copy, so a chord that never reached the focused widget raises instead of silently handing back whatever the clipboard already held. Pass `restore: true` to leave the user's clipboard as it was. Click the widget first: the copy applies to whatever holds focus, and in table-style widgets `select_all` grabs every row as TSV, which is usually what you want.
+
+Reach for OCR only when no selectable text exists. Recognizing dense monospace columns — hex dumps, byte-per-line listings — is unreliable and will silently drop and invent characters.
+
+## Driving menus and dialogs
+
+Prefer keyboard paths over clicking menu items. Accelerators and mnemonics land on the right target the first time, while a submenu entry is a coordinate guess that fails silently when the menu shifts. Where an application documents a shortcut for an action, use `keyboard.press` or `keyboard.chord`; use menu clicks only when there is no shortcut.
+
+## Confirming that typing arrived
+
+Keystrokes go wherever focus happens to be, so a click that missed its target types into nothing and every layer still reports the keystrokes as delivered. OCR makes this easy to hit: it matches the *word* you asked for, which may be body prose rather than the control that word labels. Pass `verify: true` to `keyboard.type` on any target with an element layer, and the result names what received the text:
+
+```json
+{"keyboard.type": {"text": "hunter2", "verify": true}}
+```
+
+`element.focused` answers the same question on its own — use it to check what holds focus before committing to a destructive keystroke.
+
+## Composing information and input layers
+
+Information and input do not have to come from the same adapter. VNC and RDP carry pixels, pointer and keyboard but no element tree; AT-SPI and UIA carry the tree but cannot drive real input. `element.point` resolves a selector through the richest layer available and returns a point any pointer adapter can act on, naming the layer that answered:
+
+```json
+{"element.point": {"selector": {"name": "Save", "role": "push button"}, "allow_fallback": false}}
+```
+
+The result carries `tier` (`semantic` or `visual`), `source` (the adapter that resolved it), and the `surface` the point was validated against. Feed `point` straight into `pointer.click`. Because layers can disagree about the desktop they describe, a point that falls outside the acting surface is refused rather than clicked.
+
+Semantic operations fall back to the visual path on their own, which is roughly ten times slower and far easier to mislead. The switch is only reported afterwards in `backend.fallback`, and the OCR failure then replaces the real diagnostic — `text not found` where the truth was `accessible element not found`. Pass `allow_fallback: false` on any `element.*` call that should be semantic or nothing:
+
+```json
+{"element.find": {"selector": {"name": "Username", "role": "entry"}, "allow_fallback": false}}
+```
+
+Wait for a dialog to go away with `expect: {"absent": true}` rather than assuming a confirmed action committed:
+
+```json
+{"window.wait": {"selector": {"title": "Create New Folder"}, "expect": {"absent": true}, "timeout_ms": 5000}}
+```
+
+A window existing is not the same as a window being ready. `window.wait` returns as soon as the window is mapped, which on a GTK dialog is roughly 250ms before its entry accepts keystrokes — type immediately and the characters vanish with no error anywhere. Follow `window.wait` with an `element.wait` for the widget you are about to drive, and after confirming a dialog, wait for it to disappear before the next step rather than assuming it committed.
+
+Never pad a sequence with `time.sleep` to let something load. Locators already poll: give them `timeout_ms` and let them return the moment the target exists, and wait for an outcome by locating the text that proves it rather than sleeping for a guessed duration. On a measured registration flow, fixed sleeps were 71% of the wall clock, and replacing them with these waits took the same task from 16.8s to 3.7s. Reach for `time.sleep` only for a deliberate pause with no observable signal.
+
+OCR only sees the viewport, so a locator finds nothing that sits below the fold. Give text locators a `scroll` budget to page down until the target appears; the match reports how many scrolls it took:
+
+```json
+{"element.activate": {"selector": {"text": "Username", "scroll": 8, "window": "active"}}}
+```
+
+Text locators match anywhere in the captured surface, including the address bar, window titles, page headings, and adverts that happen to share the word. Narrow with `window`, `region`, or `nth`, and set `strict` to refuse an ambiguous match rather than clicking whichever the recognizer ordered first.
+
+Text locators search the active window by default. Screen-wide recognition recovers only 36-91% of the text on a busy desktop, and it matches taskbar entries and other applications' titles as readily as the control you meant; a dialog's buttons that a full-screen pass cannot see at all read at 94% confidence inside the dialog's own rectangle. If the active window does not hold the target the search widens automatically, so nothing becomes unreachable. Pass `window: "screen"` to search the whole surface from the start.
+
+Semantic lookups run through a persistent helper on the target. Accessibility clients initialize by marshalling every application's tree, so a helper started per call pays that repeatedly — seconds when a large toolkit is running. The session pays it once and is rebuilt automatically if it dies; set `session = false` on the adapter to force one-shot calls.
+
+Role names are toolkit vocabulary rather than a shared one: the same widget is `push button` to GTK and Chrome but `button` to the Java accessibility bridge. Selectors compare roles normalized and treat known synonyms as one role, so either spelling resolves the same widget; unrelated roles still do not match.
+
+Name an application exactly, including case. Several processes can share a name fragment — a file manager and its daemon both answer to `thunar` — and an ambiguous name is refused with the candidates listed rather than resolved to whichever registered first. An exact name also returns immediately instead of interrogating every other application, which matters when one of them is a slow toolkit.
+
+Scope semantic lookups the same way with `application`. Walking every application is both slow and ambiguous: a bare `File` menu resolved to the file manager in 301ms while the same selector scoped to `application: "Ghidra"` returned Ghidra's own menu.
+
+OCR does not see isolated one- and two-character labels at all. A tree entry named `ls`, drag handles labelled `A` and `B`, and icon-only controls such as `×` or `+` return zero matches rather than a wrong match, and no page-segmentation mode recovers them. Target these through `element.*` semantics, or by coordinates read from a region capture; do not expect a text locator to find them.
+
+Pointer actions default to a human-like eased path, which costs roughly a second per click. Pass `duration_ms: 0` when realism does not matter: a click drops from about 1300ms to 175ms, and the endpoint is identical.
+
+Small controls need exact coordinates. Panel splitters, resize handles, and scrollbars are often only a few pixels wide, so a target read off a screenshot by eye can miss by two pixels and do nothing at all. When a `pointer.drag` or click appears to have no effect, re-measure the target from a fresh region capture before assuming the operation is broken.
+
+Confirm state changes rather than assuming them. A click that misses reports success, so guard consequential steps with `element.assert`, `element.wait`, a fresh `screen.observe`, or an `element.activate` `verify` block.
 
 X11 targets with `wayweaver-x11-record` expose cross-process recordings for clicks, drags, vertical scrolling, keyboard input, and accessible-element activation. Use the lifecycle API when a human needs time to interact:
 

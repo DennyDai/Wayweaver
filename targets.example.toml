@@ -2,6 +2,7 @@ cache_dir = "~/.cache/wayweaver"
 
 [targets.desktop]
 prefer = ["x11", "vnc", "cdp"]
+probe_ttl = 30
 
 [targets.desktop.ssh]
 host = "127.0.0.1"
@@ -25,6 +26,30 @@ password = "${VNC_PASSWORD:-vm}"
 [targets.desktop.cdp]
 url = "http://127.0.0.1:9222"
 scope = "page"
+
+# Pixel-only action layer with a semantic side channel. VNC and RDP carry
+# capture, pointer and keyboard but no element tree, so pair them with an
+# accessibility adapter reaching the same desktop by another route. Routing is
+# per capability: `element.point` resolves through AT-SPI while `pointer.click`
+# acts through VNC, and the resolved point is checked against the surface that
+# will receive it.
+#[targets.pixel]
+#prefer = ["vnc", "atspi", "ssh"]
+#
+#[targets.pixel.ssh]
+#host = "127.0.0.1"
+#port = 2222
+#user = "vm"
+#password = "${VM_PASSWORD:-vm}"
+#
+#[targets.pixel.atspi]
+#transport = "ssh"
+#display = ":1"
+#
+#[targets.pixel.vnc]
+#host = "127.0.0.1"
+#port = 5901
+#password = "${VNC_PASSWORD:-vm}"
 
 # Optional native Linux host target. Install its OS dependencies, then run `wayweaver runtime install host --platform linux`.
 #[targets.host]
