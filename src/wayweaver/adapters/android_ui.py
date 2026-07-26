@@ -187,6 +187,14 @@ class AndroidUI:
             return {"elements": elements[:limit], "truncated": len(elements) > limit}
         if operation == "element.wait":
             return await self.wait(options)
+        if operation == "element.focused":
+            # With no selector to fall through to, this previously reached
+            # find() with empty options and reported "element not found" --
+            # the wrong error for a question the hierarchy can answer.
+            for element in await self.elements():
+                if "focused" in element["states"]:
+                    return element
+            raise ActionError("no Android element currently has focus")
         element, _ = await self.find(options)
         if operation in {"element.find", "element.assert", "element.read"}:
             return element

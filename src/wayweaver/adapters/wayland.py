@@ -122,7 +122,7 @@ class WaylandAdapter(Adapter):
         if "wtype" in tools:
             capabilities.add(Capability.KEYBOARD)
         if "ydotool" in tools:
-            capabilities.add(Capability.POINTER)
+            capabilities.update({Capability.POINTER, Capability.SCROLL})
         self.capabilities = frozenset(capabilities)
         self.raw_operations = {
             name: description
@@ -198,6 +198,20 @@ class WaylandAdapter(Adapter):
             await self._move(end, params.get("duration_ms"))
             await self._run("ydotool click 0x80")
             return {"from": list(start), "to": list(end)}
+        if action == "scroll":
+            direction = str(params.get("direction", "down"))
+            axes = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
+            if direction not in axes:
+                raise ActionError(f"invalid scroll direction: {direction}")
+            if "x" in params and "y" in params:
+                await self._move((int(params["x"]), int(params["y"])))
+            amount = max(0, int(params.get("amount", 3)))
+            unit_x, unit_y = axes[direction]
+            # --wheel sends REL_WHEEL/REL_HWHEEL, where positive vertical means
+            # up and positive horizontal means right, one unit per notch.
+            for _ in range(amount):
+                await self._run(f"ydotool mousemove --wheel -x {unit_x} -y {unit_y}")
+            return {"direction": direction, "amount": amount}
         if action == "type":
             text = str(params.get("text", ""))
             await self._run("wtype -- " + shlex.quote(text))

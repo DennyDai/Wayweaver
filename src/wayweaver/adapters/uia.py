@@ -52,6 +52,7 @@ class UIAAdapter(Adapter):
             "element.assert": "assert",
             "element.activate": "invoke",
             "element.focus": "focus",
+            "element.focused": "focused",
             "element.read": "read",
             "element.set_value": "set-value",
         }

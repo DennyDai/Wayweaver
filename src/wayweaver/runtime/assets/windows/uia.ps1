@@ -224,6 +224,19 @@ try {
         exit 0
     }
 
+    if ($Action -eq 'focused') {
+        # Typing goes wherever focus happens to be. Without a way to ask what
+        # that is, a click that missed its target types into nothing and no
+        # layer notices.
+        $element = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if ($null -eq $element) { throw 'no element currently has keyboard focus' }
+        $result = Describe-Element $element @()
+        $value = Get-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
+        if ($null -ne $value) { $result.text = $value.Current.Value }
+        Write-Json $result
+        exit 0
+    }
+
     if ($Action -eq 'list') {
         $maxDepth = [int](Get-Option $options 'max_depth' 8)
         $limit = [int](Get-Option $options 'limit' 500)

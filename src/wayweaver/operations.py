@@ -492,8 +492,13 @@ _SPECS = (
         "element.focused",
         "Describe the element that currently holds keyboard focus",
         Capability.ELEMENTS,
-        params=object_schema({"max_depth": POSITIVE_INTEGER}),
-        examples=({},),
+        # The helper scopes to an application when asked; hiding that here
+        # forced every focus query to walk the whole desktop, which costs
+        # seconds when a large toolkit is registered.
+        params=object_schema(
+            {"max_depth": POSITIVE_INTEGER, "application": NON_EMPTY_STRING}
+        ),
+        examples=({"application": "Chrome"},),
     ),
     _spec(
         "element.point",

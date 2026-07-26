@@ -130,6 +130,14 @@ class ADBAdapter(Adapter):
         )
 
     async def act(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        if action == "move":
+            # Touch input has no persistent pointer, so a bare move cannot be
+            # expressed; routing still offers pointer.move because the pointer
+            # capability is what clicking needs.
+            raise ActionError(
+                "Android has no pointer to move; a tap happens where it lands, "
+                "so use pointer.click"
+            )
         if action in {"click", "double_click"}:
             x, y = int(params["x"]), int(params["y"])
             repeats = 2 if action == "double_click" else 1
