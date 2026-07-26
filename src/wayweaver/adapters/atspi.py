@@ -135,8 +135,41 @@ class ATSPIAdapter(Adapter):
         if operation == "element.wait":
             return await self._wait(params)
         if action := actions.get(operation):
-            return await self._call(action, params)
+            try:
+                return await self._call(action, params)
+            except ActionError as error:
+                raise await self._explain(error, params) from None
         return await super().perform(operation, params)
+
+    async def _explain(
+        self, error: ActionError, params: dict[str, Any]
+    ) -> ActionError:
+        """Add a blocking dialog to a not-found error, if one is in the way.
+
+        A modal dialog does not sit on top of the accessible tree, it replaces
+        it: a browser showing a password warning exposed 30 nodes with no
+        document at all, against 255 once the dialog was dismissed. The
+        element really is absent, so "not found" is true and useless -- the
+        caller needs to know something has to be dismissed first.
+        """
+        if "not found" not in str(error):
+            return error
+        scope = {"role": "dialog"}
+        if application := params.get("application"):
+            scope["application"] = application
+        try:
+            found = await self._call("find", scope)
+        except Exception:
+            return error
+        title = (found or {}).get("name") if isinstance(found, dict) else None
+        if not title:
+            return error
+        details = dict(error.details or {})
+        details["blocking_dialog"] = title
+        return ActionError(
+            f"{error} (a dialog is in the way: {title!r}; dismiss it first)",
+            details=details,
+        )
 
     async def close(self) -> None:
         if self._session is not None:

@@ -508,3 +508,63 @@ class AndroidPointerMoveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ActionError) as caught:
             await adapter.act("move", {"x": 10, "y": 10})
         self.assertIn("pointer.click", str(caught.exception))
+
+
+class BlockingDialogDiagnosisTests(unittest.IsolatedAsyncioTestCase):
+    """A modal does not cover the accessible tree, it replaces it.
+
+    Chrome showing its breached-password warning exposed 30 nodes with no
+    document at all, against 255 once the dialog was dismissed, so every
+    element lookup failed with a "not found" that was true and useless.
+    """
+
+    def adapter(self, replies):
+        transport = FakeTransport(responses=list(replies))
+        adapter = ATSPIAdapter("atspi", {"display": ":1", "session": False},
+                               transport)
+        return adapter, transport
+
+    async def test_a_dialog_in_the_way_is_named(self):
+        adapter, _ = self.adapter([])
+        calls = []
+
+        async def call(action, params=None):
+            calls.append((action, params))
+            if action == "find" and params.get("role") == "dialog":
+                return {"name": "Change your password", "role": "dialog"}
+            raise ActionError("accessible element not found: {}")
+
+        adapter._call = call
+        with self.assertRaises(ActionError) as caught:
+            await adapter.perform("element.find", {"name": "Username"})
+        self.assertIn("Change your password", str(caught.exception))
+        self.assertEqual(
+            caught.exception.details["blocking_dialog"], "Change your password"
+        )
+
+    async def test_no_dialog_leaves_the_error_alone(self):
+        adapter, _ = self.adapter([])
+
+        async def call(action, params=None):
+            raise ActionError("accessible element not found: {}")
+
+        adapter._call = call
+        with self.assertRaises(ActionError) as caught:
+            await adapter.perform("element.find", {"name": "Username"})
+        self.assertNotIn("in the way", str(caught.exception))
+
+    async def test_an_unrelated_failure_is_not_reinterpreted(self):
+        # Only a not-found error can be explained by a dialog; a transport
+        # failure means something else entirely.
+        adapter, _ = self.adapter([])
+        probes = []
+
+        async def call(action, params=None):
+            probes.append(action)
+            raise ActionError("AT-SPI helper exited 1")
+
+        adapter._call = call
+        with self.assertRaises(ActionError) as caught:
+            await adapter.perform("element.find", {"name": "Username"})
+        self.assertIn("exited 1", str(caught.exception))
+        self.assertEqual(probes, ["find"])

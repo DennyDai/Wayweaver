@@ -520,6 +520,7 @@ class Controller:
         detail: dict[str, Any] = {}
         scroll_budget = int(options.get("scroll", 0) or 0)
         scrolled = 0
+        last_error: Exception | None = None
         query = dict(options)
         # `options` stays intact: the OCR fallback below re-reads the same
         # timeout, so each layer gets the budget the caller named.
@@ -542,7 +543,12 @@ class Controller:
                         for key in ("name", "role", "states")
                         if key in found
                     }
-            except (CapabilityError, ActionError):
+            except (CapabilityError, ActionError) as error:
+                # Keep why it failed. Reporting only "nothing resolved this"
+                # hides the difference between an element that is absent, a
+                # layer that is unavailable, and a dialog standing in front of
+                # the whole tree -- which are three different things to do next.
+                last_error = error
                 box = None
             if box is None and time.monotonic() < deadline:
                 await asyncio.sleep(interval)
@@ -584,10 +590,14 @@ class Controller:
                 break
         if box is None:
             if not allow_fallback:
+                reason = f" ({last_error})" if last_error is not None else ""
                 raise CapabilityError(
                     "no semantic element layer resolved this selector and "
-                    "allow_fallback is false",
-                    details={"target": target},
+                    f"allow_fallback is false{reason}",
+                    details={
+                        "target": target,
+                        "reason": str(last_error) if last_error else None,
+                    },
                 )
             locator = dict(options)
             if "name" in locator and "text" not in locator:
