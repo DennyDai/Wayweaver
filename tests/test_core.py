@@ -11,7 +11,7 @@ from wayweaver.errors import ActionError, ContractError
 from wayweaver.config import ConfigError, load_config
 from wayweaver.motion import trajectory
 from wayweaver.sequence import normalize, run_sequence
-from wayweaver.vision import Word, find_text
+from wayweaver.vision import Word, find_text, ocr_items
 
 
 class CliTests(unittest.TestCase):
@@ -30,6 +30,16 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config.target("vm").adapters["ssh"]["host"], "example.test"
             )
+
+    def test_configures_target_probe_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.toml"
+            path.write_text(
+                '[targets.vm]\nprobe_ttl=45\n[targets.vm.ssh]\nhost="example.test"\n'
+            )
+            config = load_config(path)
+
+        self.assertEqual(config.target("vm").probe_ttl, 45)
 
     def test_missing_environment_is_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +99,75 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(match["match"], "fuzzy")
         self.assertEqual(match["matches"], 1)
         self.assertEqual(match["total_matches"], 2)
+
+    def test_matches_across_recognizer_word_splits(self):
+        # The same button read as "Don't" in one crop and "Dont" in another;
+        # token-for-token matching could never satisfy both spellings.
+        apostrophe = [
+            Word("Don't", "don", 95, 100, 50, 30, 20, ("1", "1", "1", "1")),
+            Word("Don't", "t", 95, 100, 50, 30, 20, ("1", "1", "1", "1")),
+            self.word("Save", "save", 140, 50),
+        ]
+        plain = [self.word("Dont", "dont", 100, 50), self.word("Save", "save", 140, 50)]
+
+        for label, words in (("apostrophe", apostrophe), ("plain", plain)):
+            for probe in ("Don't Save", "Dont Save"):
+                with self.subTest(words=label, probe=probe):
+                    match = find_text(words, {"text": probe})
+                    self.assertEqual(match["box"]["left"], 100)
+
+    def test_joined_matching_still_honours_line_boundaries(self):
+        words = [
+            self.word("Dont", "dont", 100, 50, line="1"),
+            self.word("Save", "save", 100, 90, line="2"),
+        ]
+
+        with self.assertRaises(ActionError):
+            find_text(words, {"text": "Dont Save"})
+
+    def test_strict_locator_refuses_to_guess_between_matches(self):
+        words = [self.word("Register", "register", 286, 115, "1"),
+                 self.word("Register", "register", 752, 710, "2")]
+
+        with self.assertRaises(ActionError) as raised:
+            find_text(words, {"text": "Register", "strict": True})
+
+        self.assertIn("ambiguous", str(raised.exception))
+        self.assertEqual(raised.exception.details["matches"], 2)
+
+    def test_strict_locator_accepts_an_explicit_nth(self):
+        words = [self.word("Register", "register", 286, 115, "1"),
+                 self.word("Register", "register", 752, 710, "2")]
+
+        match = find_text(words, {"text": "Register", "strict": True, "nth": 1})
+
+        self.assertEqual((match["x"], match["y"]), (777, 720))
+
+    def test_ocr_items_expose_word_coordinates_without_token_duplicates(self):
+        words = [
+            Word("Open Project", "open", 94.4, 100, 200, 120, 30, ("1", "1", "1", "1")),
+            Word(
+                "Open Project",
+                "project",
+                94.4,
+                100,
+                200,
+                120,
+                30,
+                ("1", "1", "1", "1"),
+            ),
+            self.word("Next", "next", 700, 500, "2"),
+        ]
+
+        items = ocr_items(words)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["text"], "Open Project")
+        self.assertEqual(items[0]["point"], {"x": 160, "y": 215})
+        self.assertEqual(
+            items[0]["box"],
+            {"left": 100, "top": 200, "width": 120, "height": 30},
+        )
 
 
 class FakeSSH:
@@ -181,6 +260,101 @@ class X11Tests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"index": 1})
         self.assertIn("wmctrl -s 1", ssh.commands[-1])
+
+    async def test_emits_one_x11_keyspec_for_keyboard_chords(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        result = await adapter.act("key", {"keys": ["ctrl+A"]})
+
+        self.assertEqual(result, {"keys": ["ctrl+A"]})
+        self.assertIn("xdotool key --clearmodifiers ctrl+a", ssh.commands[-1])
+
+    async def test_window_wait_returns_once_a_window_is_absent(self):
+        adapter = X11Adapter("x11", {"display": ":1"}, FakeSSH())
+
+        result = await adapter.act(
+            "wait_window", {"title": "Nonexistent", "absent": True, "timeout": 1}
+        )
+
+        self.assertEqual(result, {"absent": True})
+
+    async def test_window_wait_absent_fails_while_the_window_remains(self):
+        adapter = X11Adapter("x11", {"display": ":1"}, FakeSSH())
+
+        with self.assertRaises(ActionError) as raised:
+            await adapter.act(
+                "wait_window",
+                {"title": "terminal", "absent": True, "timeout": 0, "interval": 0.05},
+            )
+
+        self.assertIn("still present", str(raised.exception))
+
+    async def test_unpositioned_scroll_targets_the_active_window(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        await adapter.act("scroll", {"direction": "down", "amount": 2})
+
+        # wmctrl reports the active window at 10,20 sized 800x600.
+        self.assertIn("xdotool mousemove 410 320", ssh.commands[-1])
+        self.assertIn("xdotool click --repeat 2", ssh.commands[-1])
+
+    async def test_positioned_scroll_uses_the_given_point(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        await adapter.act("scroll", {"direction": "down", "x": 760, "y": 600})
+
+        self.assertIn("xdotool mousemove 760 600", ssh.commands[-1])
+
+    async def test_types_text_that_begins_with_a_dash(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        result = await adapter.act("type", {"text": "-usage"})
+
+        self.assertEqual(result, {"characters": 6})
+        self.assertIn("-- -usage", ssh.commands[-1])
+
+    async def test_preserves_keysym_case_for_named_keys_in_chords(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        for keys, expected in (
+            (["ctrl+Return"], "ctrl+Return"),
+            (["alt+F4"], "alt+F4"),
+            (["super+Left"], "super+Left"),
+            (["ctrl", "BackSpace"], "ctrl+BackSpace"),
+            (["ctrl+shift+Tab"], "ctrl+shift+Tab"),
+        ):
+            with self.subTest(keys=keys):
+                await adapter.act("key", {"keys": keys})
+                self.assertIn(
+                    f"xdotool key --clearmodifiers {expected}", ssh.commands[-1]
+                )
+
+    async def test_single_key_press_keeps_its_canonical_keysym(self):
+        ssh = FakeSSH()
+        adapter = X11Adapter("x11", {"display": ":1"}, ssh)
+
+        await adapter.act("key", {"keys": ["Return"]})
+
+        self.assertIn("xdotool key --clearmodifiers Return", ssh.commands[-1])
+
+    async def test_unresolvable_keysym_fails_instead_of_reporting_success(self):
+        class RejectingSSH(FakeSSH):
+            async def shell(self, command, stdin=None):
+                await super().shell(command, stdin)
+                return 0, b"", b"(symbol) No such key name 'return'. Ignoring it.\n"
+
+        adapter = X11Adapter("x11", {"display": ":1"}, RejectingSSH())
+
+        with self.assertRaises(ActionError) as raised:
+            await adapter.act("key", {"keys": ["ctrl+return"]})
+
+        self.assertIn("ctrl+return", str(raised.exception))
+        self.assertEqual(raised.exception.details["key_spec"], "ctrl+return")
 
     def test_recorder_prefers_accessible_elements_and_preserves_fallbacks(self):
         output = """BUTTON_DOWN 1 1145 716 1200
