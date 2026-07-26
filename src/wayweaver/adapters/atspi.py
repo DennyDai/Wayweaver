@@ -9,6 +9,13 @@ from ..types import Capability
 from .base import Adapter, ShellSession, require_shell_transport
 
 
+#: A scoped element query is single-digit milliseconds, so a wait can afford
+#: to look almost immediately; anything still absent after that is usually
+#: waiting on something slow, where frequent looks only take cycles from it.
+_WAIT_FIRST = 0.05
+_WAIT_GROWTH = 1.6
+
+
 class ATSPIAdapter(Adapter):
     kind = "atspi"
     capabilities = frozenset({Capability.ELEMENTS})
@@ -117,9 +124,19 @@ class ATSPIAdapter(Adapter):
             return False, str(error)
 
     async def _wait(self, params: dict[str, Any]) -> Any:
+        """Wait for an element, looking often at first and then less often.
+
+        A scoped query costs single-digit milliseconds, so the first few looks
+        are nearly free and the element is usually there within one of them.
+        A wait that does not resolve quickly is usually waiting on something
+        slow -- an analysis, a page load -- where checking twenty times a
+        second only steals cycles from the thing being waited on. `interval`
+        is the ceiling the backoff climbs to rather than a fixed period.
+        """
         timeout = max(0.0, float(params.get("timeout", 5)))
         minimum_interval = max(0.0, float(self.config.get("wait_min_interval", 1)))
         interval = max(minimum_interval, float(params.get("interval", 1)))
+        wait = min(_WAIT_FIRST, interval)
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             try:
@@ -129,7 +146,8 @@ class ATSPIAdapter(Adapter):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise last_error
-            await asyncio.sleep(min(interval, remaining))
+            await asyncio.sleep(min(wait, remaining))
+            wait = min(interval, wait * _WAIT_GROWTH)
 
     async def perform(self, operation: str, params: dict[str, Any]) -> Any:
         actions = {

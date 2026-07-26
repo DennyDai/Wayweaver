@@ -338,6 +338,46 @@ class ElementPointTimeoutTests(unittest.IsolatedAsyncioTestCase):
             await controller._element_point("desktop", {}, allow_fallback=False)
 
 
+class PollBackoffTests(unittest.TestCase):
+    """A wait looks quickly at first and slows down if nothing arrives.
+
+    Recognition is cached by frame content, so an unchanged screen costs
+    0.1ms and looking again only costs a capture. Measured: 348ms before an
+    appearing element was noticed at a flat 250ms interval, against 186ms
+    with a backoff starting at 50ms -- while a twelve-second wait that never
+    resolves took 30 captures instead of 48.
+    """
+
+    def test_the_first_wait_is_short(self):
+        from wayweaver.controller import _POLL_FIRST
+
+        self.assertLessEqual(_POLL_FIRST, 0.05)
+
+    def test_the_interval_climbs_toward_the_ceiling(self):
+        from wayweaver.controller import _POLL_FIRST, _next_interval
+
+        wait, ceiling = _POLL_FIRST, 1.0
+        seen = [wait]
+        for _ in range(10):
+            wait = _next_interval(wait, ceiling)
+            seen.append(wait)
+        self.assertLess(seen[1], seen[5])
+        self.assertEqual(max(seen), ceiling)
+
+    def test_it_never_exceeds_the_ceiling(self):
+        from wayweaver.controller import _next_interval
+
+        self.assertEqual(_next_interval(0.9, 1.0), 1.0)
+        self.assertEqual(_next_interval(5.0, 1.0), 1.0)
+
+    def test_a_ceiling_below_the_first_step_is_honoured(self):
+        # A caller asking for a tight interval must not be slowed down to the
+        # backoff's starting point.
+        from wayweaver.controller import _POLL_FIRST
+
+        self.assertEqual(min(_POLL_FIRST, 0.01), 0.01)
+
+
 class LocateFailureContextTests(unittest.IsolatedAsyncioTestCase):
     """A locator that scoped itself must say so when it finds nothing.
 

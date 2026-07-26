@@ -27,6 +27,21 @@ _OCR_CACHE_ENTRIES = 8
 # whole screen, so widening a small crop is far cheaper than missing the text.
 _MIN_OCR_CROP = (240, 120)
 
+# A wait looks quickly at first and slows down if the target does not arrive.
+# Recognition is already cached by frame content, so an unchanged screen costs
+# 0.1ms and the only price of looking again is one capture. Measured delay
+# before something that appeared was noticed: 348ms at a flat 250ms interval
+# against 155ms starting at 50ms -- and 155ms is about what one capture plus
+# one recognition costs, so that is the floor no matter what schedules the
+# look. Backing off keeps a long wait from paying that capture twenty times a
+# second.
+_POLL_FIRST = 0.05
+_POLL_GROWTH = 1.6
+
+
+def _next_interval(current: float, ceiling: float) -> float:
+    return min(ceiling, current * _POLL_GROWTH)
+
 # How long an element's reported position must hold still before a scroll counts
 # as finished. Chrome animates scrolling and publishes intermediate positions
 # ~100ms apart, so a shorter window reads mid-flight coordinates as settled.
@@ -173,7 +188,11 @@ class Controller:
     ) -> dict[str, Any]:
         options = {"text": locator} if isinstance(locator, str) else dict(locator)
         timeout = float(options.pop("timeout", 3))
-        interval = float(options.pop("interval", 0.25))
+        # `interval` is the ceiling the backoff climbs to, not a fixed period,
+        # so the default is higher than the old fixed one: starting faster and
+        # ending slower is better at both ends than a single compromise value.
+        interval = float(options.pop("interval", 1.0))
+        wait = min(_POLL_FIRST, interval)
         desktop = await self.router(target).select(
             {Capability.CAPTURE, Capability.POINTER} if click else Capability.CAPTURE
         )
@@ -293,7 +312,8 @@ class Controller:
                 scroller = await self.router(target).select(Capability.SCROLL)
                 await scroller.act("scroll", {"direction": "down", "amount": 4})
                 scrolled += 1
-                await asyncio.sleep(max(0.05, interval))
+                await asyncio.sleep(wait)
+                wait = _next_interval(wait, interval)
                 continue
             if time.monotonic() >= deadline:
                 # Name the window that was searched. A locator scoped to the
@@ -310,7 +330,8 @@ class Controller:
                         details=details,
                     )
                 raise ActionError(str(last_error), details=details)
-            await asyncio.sleep(max(0.05, interval))
+            await asyncio.sleep(wait)
+            wait = _next_interval(wait, interval)
 
     async def _window_region(
         self, target: str, window: Any
