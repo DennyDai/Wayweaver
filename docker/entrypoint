@@ -24,6 +24,13 @@ install -d -o "${VM_UID}" -g "${VM_GID}" -m 0700 /home/vm/.vnc
 install -d -o "${VM_UID}" -g "${VM_GID}" -m 0700 /home/vm/.chrome-cdp
 install -d -o "${VM_UID}" -g "${VM_GID}" -m 0755 /home/vm/Downloads
 install -d -o "${VM_UID}" -g "${VM_GID}" -m 0700 "${VM_RUNTIME_DIR}"
+
+# `install -d` sets ownership on the directory it creates, not on what is
+# already inside it. A mounted or carried-over home therefore keeps files owned
+# by whoever wrote them, and a Chrome profile whose Preferences ended up
+# root-owned greets every session with "Your preferences can not be read" --
+# a dialog that then sits in front of the desktop for the whole run.
+chown -R "${VM_UID}:${VM_GID}" /home/vm
 install -d -m 1777 /tmp/.X11-unix
 install -d -m 1777 /tmp/.ICE-unix
 

@@ -68,9 +68,18 @@ RUN if [[ "${TARGETARCH}" != "amd64" ]]; then \
 # Chrome's save-password bubble and first-run promos steal focus and cover the
 # page mid-flow, which stalls automation on an unrelated modal. Policy disables
 # them for every profile in the image.
+#
+# A modal does more than cover the page: it replaces it in the accessibility
+# tree. Chrome showing its breached-password warning exposed 30 nodes with no
+# document at all, against 255 once dismissed, so every element lookup failed
+# with a truthful and useless "not found". Leak detection fires on any password
+# that appears in a breach list, which includes the ones public test sites
+# publish, so it triggers on ordinary automation.
 RUN mkdir -p /etc/opt/chrome/policies/managed \
  && printf '%s\n' \
       '{' \
+      '  "PasswordLeakDetectionEnabled": false,' \
+      '  "SafeBrowsingProtectionLevel": 0,' \
       '  "PasswordManagerEnabled": false,' \
       '  "AutofillAddressEnabled": false,' \
       '  "AutofillCreditCardEnabled": false,' \
