@@ -189,11 +189,14 @@ class Controller:
         # `window: "screen"` to search the whole surface anyway.
         window = options.pop("window", None)
         auto_scoped = False
+        scoped_title = None
         if window == "screen":
             window = None
         elif region is None:
             try:
-                region = await self._window_region(target, window or "active")
+                region, scoped_title = await self._window_region(
+                    target, window or "active"
+                )
                 # Scoping the caller did not ask for is an optimization, so it
                 # must never remove reach: if the active window does not hold
                 # the target, the search widens to the whole screen below.
@@ -293,13 +296,30 @@ class Controller:
                 await asyncio.sleep(max(0.05, interval))
                 continue
             if time.monotonic() >= deadline:
-                raise ActionError(str(last_error))
+                # Name the window that was searched. A locator scoped to the
+                # active window reports plain "text not found" when a dialog
+                # has taken focus, which reads as "the text is not on screen"
+                # when the truth is "something else is in front of it".
+                details: dict[str, Any] = {"text": options.get("text")}
+                if scoped_title is not None:
+                    details["searched_window"] = scoped_title
+                    raise ActionError(
+                        f"{last_error} (searched the active window "
+                        f"{scoped_title!r}; pass window to choose another, or "
+                        '"screen" for the whole surface)',
+                        details=details,
+                    )
+                raise ActionError(str(last_error), details=details)
             await asyncio.sleep(max(0.05, interval))
 
-    async def _window_region(self, target: str, window: Any) -> list[int]:
-        """Resolve a locator's `window` to its [left, top, right, bottom] rectangle.
+    async def _window_region(
+        self, target: str, window: Any
+    ) -> tuple[list[int], str]:
+        """Resolve a locator's `window` to its rectangle and its title.
 
         Accepts "active" or a title substring; matching is case-insensitive.
+        Returns [left, top, right, bottom] together with the title, so a
+        failure can say which window was searched.
         """
         try:
             adapter = await self.router(target).select(Capability.WINDOWS)
@@ -331,7 +351,10 @@ class Controller:
                 details={"window": window},
             )
         left, top = int(chosen["x"]), int(chosen["y"])
-        return [left, top, left + int(chosen["width"]), top + int(chosen["height"])]
+        return (
+            [left, top, left + int(chosen["width"]), top + int(chosen["height"])],
+            str(chosen.get("title", "")),
+        )
 
     async def _application_hint(self, target: str) -> str | None:
         """Name the active window's application, to scope an element search.
@@ -539,7 +562,7 @@ class Controller:
             frame, _ = await self.capture(target)
             top_bound, bottom_bound = 0, frame.height
             try:
-                window_region = await self._window_region(target, "active")
+                window_region, _ = await self._window_region(target, "active")
                 top_bound = max(top_bound, int(window_region[1]))
                 bottom_bound = min(bottom_bound, int(window_region[3]))
             except (ActionError, CapabilityError):

@@ -338,6 +338,67 @@ class ElementPointTimeoutTests(unittest.IsolatedAsyncioTestCase):
             await controller._element_point("desktop", {}, allow_fallback=False)
 
 
+class LocateFailureContextTests(unittest.IsolatedAsyncioTestCase):
+    """A locator that scoped itself must say so when it finds nothing.
+
+    Scoping to the active window is an optimization the caller did not ask
+    for, so "text not found" reads as "the text is not on screen" when the
+    truth is that a dialog took focus and the search never looked at the
+    window the caller had in mind.
+    """
+
+    def controller(self, title):
+        from wayweaver.controller import Controller
+
+        controller = Controller.__new__(Controller)
+        controller.config = SimpleNamespace(cache_dir=Path("/tmp/wayweaver-test"))
+        controller._ocr_cache = {}
+
+        class Desktop:
+            name = "x11"
+
+            async def capture(self, params=None):
+                return Frame(b"", 1600, 900, "x11")
+
+        class FakeRouter:
+            async def select(self, requirement):
+                return Desktop()
+
+        controller.router = lambda target: FakeRouter()
+
+        async def region(target, window):
+            if title is None:
+                raise CapabilityError("no window metadata")
+            return [0, 51, 1600, 900], title
+
+        controller._window_region = region
+
+        async def ocr(target, frame):
+            return []
+
+        controller._ocr = ocr
+        return controller
+
+    async def test_the_searched_window_is_named(self):
+        controller = self.controller("Defined Strings [CodeBrowser]")
+        with self.assertRaises(ActionError) as caught:
+            await controller.locate("desktop", {"text": "Analysis", "timeout": 0})
+        message = str(caught.exception)
+        self.assertIn("Defined Strings [CodeBrowser]", message)
+        self.assertIn("window", message)
+        self.assertEqual(
+            caught.exception.details["searched_window"],
+            "Defined Strings [CodeBrowser]",
+        )
+
+    async def test_a_target_without_windows_says_nothing_extra(self):
+        # Pixel-only surfaces never scoped, so there is no window to blame.
+        controller = self.controller(None)
+        with self.assertRaises(ActionError) as caught:
+            await controller.locate("desktop", {"text": "Analysis", "timeout": 0})
+        self.assertNotIn("searched the active window", str(caught.exception))
+
+
 class ScrollBoundaryTests(unittest.IsolatedAsyncioTestCase):
     """Reachable means inside the window showing the element, not on the screen.
 
@@ -390,7 +451,7 @@ class ScrollBoundaryTests(unittest.IsolatedAsyncioTestCase):
         async def region(target, window):
             if window_region is None:
                 raise CapabilityError("no window metadata")
-            return window_region
+            return window_region, "Test Window"
 
         controller._window_region = region
 
