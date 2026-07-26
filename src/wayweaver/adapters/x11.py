@@ -374,7 +374,18 @@ class X11Adapter(Adapter):
             if action != "move":
                 button = 3 if action == "right_click" else int(params.get("button", 1))
                 repeat = 2 if action == "double_click" else 1
-                script += f"; xdotool click --clearmodifiers --repeat {repeat} --delay 120 {button}"
+                # xdotool sleeps --delay after every click, a single one
+                # included, which measured as ~108ms of a ~125ms click while
+                # the click itself lands in ~28ms. A lone click has no
+                # interval to space out. A double click still needs one, short
+                # enough to read as a double click and long enough for the
+                # toolkit to see two presses. Verified against the DOM at
+                # 15/15 for a single click.
+                delay = 60 if repeat > 1 else 12
+                script += (
+                    f"; xdotool click --clearmodifiers --repeat {repeat} "
+                    f"--delay {delay} {button}"
+                )
             await self._run(script)
             return {"x": x, "y": y, "action": action}
         if action == "drag":
@@ -417,7 +428,11 @@ class X11Adapter(Adapter):
                 prefix = await self._move_script(*point) + "; "
             amount = max(0, int(params.get("amount", 3)))
             await self._run(
-                f"{prefix}xdotool click --repeat {amount} --delay 60 {buttons[direction]}"
+                # Wheel notches only need spacing the toolkit can tell apart;
+                # 60ms cost 211ms for three notches against 89ms at 20ms, with
+                # the page scrolling on 5/5 either way.
+                f"{prefix}xdotool click --repeat {amount} --delay 20 "
+                f"{buttons[direction]}"
             )
             return {"direction": direction, "amount": amount}
         if action == "type":
