@@ -98,6 +98,7 @@ RUN groupmod --new-name vm ubuntu \
 COPY docker/chrome /usr/local/bin/chrome
 COPY docker/start-desktop /usr/local/bin/start-desktop
 COPY docker/enable-accessibility /usr/local/bin/enable-accessibility
+COPY docker/session-rejoin /usr/local/bin/session-rejoin
 COPY docker/start-chrome /usr/local/bin/start-chrome
 COPY src/wayweaver/_version.py /tmp/wayweaver-version.py
 COPY src/wayweaver/runtime/assets/linux/ /tmp/wayweaver-runtime/
@@ -121,6 +122,7 @@ RUN version="$(python3 -c 'scope={}; exec(open("/tmp/wayweaver-version.py").read
       /usr/local/bin/chrome \
       /usr/local/bin/start-desktop \
       /usr/local/bin/enable-accessibility \
+      /usr/local/bin/session-rejoin \
       /usr/local/bin/start-chrome \
       /usr/local/bin/desktop-vm-entrypoint \
       /etc/profile.d/desktop-env.sh

@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Restart Chrome when the desktop session restarts.
+
+The accessibility bus lives inside the desktop session's D-Bus instance, so
+when xfce4-session dies and supervisord brings the desktop back, every
+application that survived is still connected to the dead bus. They keep
+running and keep rendering -- and disappear from the semantic layer, which
+only sees the new bus. Chrome does not rejoin on its own; restarting it is
+the only way back.
+
+Observed live: a desktop restart left Chrome healthy for hours while
+element.find reported the whole application missing.
+
+This speaks the supervisord eventlistener protocol on stdin/stdout, so
+stdout carries nothing but protocol lines; diagnostics go to stderr.
+"""
+import subprocess
+import sys
+
+
+def send(line):
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def main():
+    # READY must precede every event, not just the first: supervisord holds
+    # further events until the listener re-announces itself, so a single READY
+    # processes exactly one event and then waits forever.
+    while True:
+        send("READY\n")
+        header = dict(
+            token.split(":", 1) for token in sys.stdin.readline().split()
+        )
+        payload = sys.stdin.read(int(header["len"]))
+        fields = dict(token.split(":", 1) for token in payload.split())
+        if fields.get("processname") == "desktop":
+            status = subprocess.run(
+                ["supervisorctl", "status", "chrome"],
+                capture_output=True,
+                text=True,
+            ).stdout
+            # At boot the desktop enters RUNNING before Chrome has started;
+            # only a Chrome that predates this session needs to rejoin.
+            if "RUNNING" in status:
+                print(
+                    "desktop session restarted; restarting chrome to rejoin "
+                    "the accessibility bus",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                subprocess.run(
+                    ["supervisorctl", "restart", "chrome"], capture_output=True
+                )
+        send("RESULT 2\nOK")
+
+
+if __name__ == "__main__":
+    main()
