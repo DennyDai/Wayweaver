@@ -125,3 +125,77 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActivationVerificationTests(unittest.IsolatedAsyncioTestCase):
+    """A release that fails verification must not be activated.
+
+    The check chain used to end at a `;`, so the shell carried on and
+    activated the release anyway, with the overall exit status taken from the
+    commands after it -- verification was decorative. Reproduced against a
+    real shell before the fix: a release with a wrong hash activated with
+    exit 0.
+    """
+
+    def run_activation(self, prepare):
+        import asyncio
+        import os
+        import subprocess
+        import tempfile
+
+        from wayweaver.runtime import RUNTIME_VERSION
+        from wayweaver.runtime.deploy import (
+            _LINUX_ASSETS,
+            _linux_activation_command,
+            _linux_release_name,
+            asset_bytes,
+        )
+
+        release_name = _linux_release_name()
+        with tempfile.TemporaryDirectory() as home:
+            root = os.path.join(home, "wayweaver", "runtime")
+            release = os.path.join(root, "releases", release_name)
+            os.makedirs(os.path.join(release, "bin"))
+            with open(os.path.join(release, "manifest.json"), "w") as stream:
+                stream.write("{}")
+            for asset in _LINUX_ASSETS:
+                with open(os.path.join(release, asset.destination), "wb") as stream:
+                    stream.write(asset_bytes(asset))
+            prepare(release)
+            completed = subprocess.run(
+                ["bash", "-c", _linux_activation_command(release_name)],
+                env={**os.environ, "XDG_CACHE_HOME": home},
+                capture_output=True,
+            )
+            active = os.path.join(root, RUNTIME_VERSION)
+            return completed.returncode, os.path.islink(active)
+
+    def test_a_verified_release_activates(self):
+        code, activated = self.run_activation(lambda release: None)
+        self.assertEqual(code, 0)
+        self.assertTrue(activated)
+
+    def test_a_corrupt_release_is_not_activated(self):
+        import os
+
+        def corrupt(release):
+            from wayweaver.runtime.deploy import _LINUX_ASSETS
+
+            with open(
+                os.path.join(release, _LINUX_ASSETS[0].destination), "ab"
+            ) as stream:
+                stream.write(b"tampered")
+
+        code, activated = self.run_activation(corrupt)
+        self.assertEqual(code, 5)
+        self.assertFalse(activated)
+
+    def test_a_release_without_a_manifest_is_not_activated(self):
+        import os
+
+        def strip(release):
+            os.unlink(os.path.join(release, "manifest.json"))
+
+        code, activated = self.run_activation(strip)
+        self.assertEqual(code, 5)
+        self.assertFalse(activated)

@@ -369,3 +369,142 @@ class RDPSessionTests(unittest.IsolatedAsyncioTestCase):
             available, reason = await adapter.available()
         self.assertFalse(available)
         self.assertIn("wayweaver-agent[rdp]", reason)
+
+
+FOCUSED_XML = ANDROID_XML.replace(
+    b'text="Delete" resource-id="demo:id/delete"', b'text="Delete" resource-id="demo:id/delete"', 1
+).replace(
+    b'focusable="true" focused="false" scrollable="false" long-clickable="true"',
+    b'focusable="true" focused="true" scrollable="false" long-clickable="true"',
+    1,
+)
+
+
+class ElementFocusedTests(unittest.IsolatedAsyncioTestCase):
+    """element.focused must be answerable by every layer that claims elements.
+
+    Routing advertises the operation from the capability alone, so a layer
+    without an implementation fails at perform time with an error that blames
+    the selector rather than the gap.
+    """
+
+    async def test_android_reports_the_focused_element(self):
+        outputs = [b"", FOCUSED_XML]
+
+        async def run(*args):
+            return outputs.pop(0)
+
+        ui = AndroidUI(run)
+        element = await ui.perform("element.focused", {})
+        self.assertEqual(element["name"], "Delete item")
+        self.assertIn("focused", element["states"])
+
+    async def test_android_says_so_when_nothing_has_focus(self):
+        outputs = [b"", ANDROID_XML]
+
+        async def run(*args):
+            return outputs.pop(0)
+
+        ui = AndroidUI(run)
+        with self.assertRaises(ActionError) as caught:
+            await ui.perform("element.focused", {})
+        self.assertIn("focus", str(caught.exception))
+
+    async def test_uia_maps_the_operation_to_its_helper(self):
+        transport = FakeTransport(responses=[{"name": "Notepad"}])
+        adapter = UIAAdapter("uia", {"transport": "t", "command": "uia.ps1"}, transport)
+        result = await adapter.perform("element.focused", {})
+        self.assertEqual(result["name"], "Notepad")
+        self.assertIn("-Action focused", transport.calls[-1][0])
+
+    def test_the_powershell_helper_implements_the_action(self):
+        from pathlib import Path
+
+        helper = (
+            Path(__file__).resolve().parent.parent
+            / "src/wayweaver/runtime/assets/windows/uia.ps1"
+        ).read_text()
+        self.assertIn("$Action -eq 'focused'", helper)
+        self.assertIn("FocusedElement", helper)
+
+
+class VNCTypedTextTests(unittest.TestCase):
+    """Typed characters must arrive as the keysyms X actually defines.
+
+    A codepoint below 0x100 is its own keysym, which is why ASCII happened to
+    work when characters were sent as ord() -- and why everything else
+    silently vanished. Verified live: 'abc<e-acute><CJK>!' arrived as
+    'abc<e-acute>!' before, intact after.
+    """
+
+    def test_ascii_and_latin1_are_their_own_keysyms(self):
+        from wayweaver.adapters.vnc import _text_keysym
+
+        self.assertEqual(_text_keysym("a"), 0x61)
+        self.assertEqual(_text_keysym("é"), 0xE9)
+
+    def test_wider_unicode_gets_the_keysym_offset(self):
+        from wayweaver.adapters.vnc import _text_keysym
+
+        self.assertEqual(_text_keysym("中"), 0x01000000 + 0x4E2D)
+
+    def test_newline_and_tab_travel_as_their_keys(self):
+        from wayweaver.adapters.vnc import _text_keysym
+
+        self.assertEqual(_text_keysym("\n"), 0xFF0D)
+        self.assertEqual(_text_keysym("\r"), 0xFF0D)
+        self.assertEqual(_text_keysym("\t"), 0xFF09)
+
+    def test_other_control_characters_are_refused(self):
+        from wayweaver.adapters.vnc import _text_keysym
+
+        with self.assertRaises(ActionError):
+            _text_keysym("\x03")
+
+
+class WaylandScrollTests(unittest.IsolatedAsyncioTestCase):
+    """ydotool's wheel mode carries scrolling; not claiming it left wayland
+    targets with no scroll at all."""
+
+    def adapter(self):
+        from wayweaver.adapters.wayland import WaylandAdapter
+
+        class Transport(Adapter):
+            kind = "ssh"
+            capabilities = frozenset({Capability.SHELL})
+
+            def __init__(self):
+                super().__init__("ssh", {})
+                self.commands = []
+
+            async def shell(self, command, stdin=None):
+                self.commands.append(command)
+                return 0, b"", b""
+
+        transport = Transport()
+        return WaylandAdapter("wayland", {}, transport), transport
+
+    async def test_scroll_uses_wheel_units(self):
+        adapter, transport = self.adapter()
+        await adapter.act("scroll", {"direction": "down", "amount": 2})
+        wheel = [c for c in transport.commands if "--wheel" in c]
+        self.assertEqual(len(wheel), 2)
+        self.assertIn("-x 0 -y -1", wheel[0])
+
+    async def test_horizontal_scroll_is_expressible(self):
+        adapter, transport = self.adapter()
+        await adapter.act("scroll", {"direction": "right", "amount": 1})
+        self.assertIn("-x 1 -y 0", transport.commands[-1])
+
+    async def test_an_unknown_direction_is_refused(self):
+        adapter, _ = self.adapter()
+        with self.assertRaises(ActionError):
+            await adapter.act("scroll", {"direction": "sideways"})
+
+
+class AndroidPointerMoveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_bare_move_is_refused_with_the_reason(self):
+        adapter = ADBAdapter("adb", {})
+        with self.assertRaises(ActionError) as caught:
+            await adapter.act("move", {"x": 10, "y": 10})
+        self.assertIn("pointer.click", str(caught.exception))

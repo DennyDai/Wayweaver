@@ -279,6 +279,94 @@ class CDPTransportTests(unittest.TestCase):
         self.assertEqual(adapter._call("Runtime.evaluate", {}), {"value": 7})
 
 
+class ScrollBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    """Reachable means inside the window showing the element, not on the screen.
+
+    A window shorter than the screen leaves a band where a point is numerically
+    on the surface and physically on whatever sits beneath the window. Measured
+    live: a field at desktop y=899 under a window ending at 890 on a 900px
+    screen was ruled reachable, and the click landed on the panel below.
+    """
+
+    def controller(self, window_region):
+        from wayweaver.controller import Controller
+
+        controller = Controller.__new__(Controller)
+
+        class Elements:
+            name = "atspi"
+
+            def __init__(self):
+                self.position = 880
+                self.queries = 0
+
+            async def perform(self, _operation, _params):
+                self.queries += 1
+                return {"bounds": {"left": 394, "top": self.position,
+                                   "width": 216, "height": 39}}
+
+        class Scroller:
+            def __init__(self, elements):
+                self.elements = elements
+                self.scrolls = []
+
+            async def act(self, _action, params):
+                self.scrolls.append(params)
+                self.elements.position = 500
+
+        elements = Elements()
+        scroller = Scroller(elements)
+
+        class FakeRouter:
+            async def select(self, requirement):
+                return scroller if requirement == Capability.SCROLL else elements
+
+        controller.router = lambda target: FakeRouter()
+
+        async def capture(target, params=None):
+            return SimpleNamespace(width=1600, height=900), "x11"
+
+        controller.capture = capture
+
+        async def region(target, window):
+            if window_region is None:
+                raise CapabilityError("no window metadata")
+            return window_region
+
+        controller._window_region = region
+
+        async def hint(target):
+            return None
+
+        controller._application_hint = hint
+        return controller, elements, scroller
+
+    async def test_a_point_below_the_window_triggers_a_scroll(self):
+        controller, elements, scroller = self.controller([10, 37, 1060, 890])
+        result = await controller._element_point(
+            "desktop", {"scroll": 2}, allow_fallback=False
+        )
+        self.assertEqual(len(scroller.scrolls), 1)
+        self.assertEqual(scroller.scrolls[0]["direction"], "down")
+        self.assertEqual(result["point"]["y"], 500 + 39 // 2)
+
+    async def test_without_window_metadata_the_screen_still_bounds(self):
+        # Pixel-only targets report no windows; the screen is all there is.
+        controller, elements, scroller = self.controller(None)
+        result = await controller._element_point(
+            "desktop", {"scroll": 2}, allow_fallback=False
+        )
+        self.assertEqual(scroller.scrolls, [])
+        self.assertEqual(result["point"]["y"], 880 + 39 // 2)
+
+    async def test_a_point_above_the_window_scrolls_up(self):
+        controller, elements, scroller = self.controller([10, 400, 1060, 890])
+        elements.position = 200
+        await controller._element_point("desktop", {"scroll": 2},
+                                        allow_fallback=False)
+        self.assertEqual(scroller.scrolls[0]["direction"], "up")
+
+
 class CleanupTests(unittest.IsolatedAsyncioTestCase):
     """Cleanup that stops at the first failure leaks everything after it.
 
@@ -1575,10 +1663,12 @@ class WaylandTests(unittest.IsolatedAsyncioTestCase):
                     Capability.CLIPBOARD,
                     Capability.KEYBOARD,
                     Capability.POINTER,
+                    # ydotool's wheel mode carries scrolling, so pointer and
+                    # scroll arrive together.
+                    Capability.SCROLL,
                 }
             ),
         )
-        self.assertNotIn(Capability.SCROLL, adapter.capabilities)
         self.assertEqual(
             adapter.raw_operations,
             {
