@@ -643,3 +643,67 @@ class SequenceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextOutputTests(unittest.TestCase):
+    """Recognized text must survive being assembled into lines.
+
+    Comparing each word only against the previous one collapsed genuine
+    repetition, silently rewriting what the caller reads off the screen.
+    """
+
+    @staticmethod
+    def word(text, left, line=("1", "1", "1", "1")):
+        from wayweaver.vision import Word
+
+        return Word(
+            text=text,
+            token=text.casefold(),
+            confidence=90.0,
+            left=left,
+            top=0,
+            width=20,
+            height=10,
+            line=line,
+        )
+
+    def test_repeated_words_are_preserved(self):
+        from wayweaver.vision import text_output
+
+        words = [
+            self.word(text, index * 30)
+            for index, text in enumerate(["Total", "1", "1", "1", "done"])
+        ]
+        self.assertEqual(text_output(words), "Total 1 1 1 done")
+
+    def test_a_word_emitted_twice_at_one_place_is_collapsed(self):
+        from wayweaver.vision import text_output
+
+        duplicate = self.word("OK", 5)
+        self.assertEqual(text_output([duplicate, duplicate, duplicate]), "OK")
+
+    def test_lines_stay_separate(self):
+        from wayweaver.vision import text_output
+
+        words = [
+            self.word("one", 0, ("1", "1", "1", "1")),
+            self.word("two", 0, ("1", "1", "2", "1")),
+        ]
+        self.assertEqual(text_output(words), "one\ntwo")
+
+
+class PngSizeTests(unittest.TestCase):
+    def test_a_truncated_capture_is_reported_as_a_bad_capture(self):
+        from wayweaver.errors import ProtocolError
+        from wayweaver.image import png_size
+
+        # A partial read can carry a valid signature and stop before the
+        # dimensions, which unpacking reported as a struct error.
+        truncated = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4 + b"IHDR" + b"\x00\x00"
+        with self.assertRaises(ProtocolError):
+            png_size(truncated)
+
+    def test_a_real_png_header_still_reads(self):
+        from wayweaver.image import encode_png, png_size
+
+        self.assertEqual(png_size(encode_png(3, 2, b"\x00" * 18)), (3, 2))

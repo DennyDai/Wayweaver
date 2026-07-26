@@ -5,7 +5,10 @@ from .errors import ProtocolError
 
 
 def png_size(data: bytes) -> tuple[int, int]:
-    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+    # A truncated capture -- a partial read from a device -- can carry a valid
+    # signature and still stop before the dimensions, which unpacking reports
+    # as a struct error rather than as the bad capture it is.
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
         raise ProtocolError("capture did not return a PNG")
     return struct.unpack(">II", data[16:24])
 

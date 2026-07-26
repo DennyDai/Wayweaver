@@ -231,8 +231,20 @@ def ocr_items(words: list[Word]) -> list[dict[str, Any]]:
 
 
 def text_output(words: list[Word]) -> str:
+    """Join recognized words into lines of text.
+
+    Duplicates are identified by position as well as by text. Comparing only
+    against the previous word collapsed genuine repetition -- a row reading
+    "Total 1 1 1" came back as "Total 1" -- which silently rewrites the text an
+    agent is reading. A word the recognizer really did emit twice occupies the
+    same box, so the box is what distinguishes them.
+    """
     lines: dict[tuple[str, str, str, str], list[str]] = {}
+    seen: set[tuple[Any, ...]] = set()
     for word in words:
-        if not lines.get(word.line) or lines[word.line][-1] != word.text:
-            lines.setdefault(word.line, []).append(word.text)
+        identity = (word.line, word.text, word.left, word.top, word.width, word.height)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        lines.setdefault(word.line, []).append(word.text)
     return "\n".join(" ".join(line) for line in lines.values())
