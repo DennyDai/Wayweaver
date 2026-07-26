@@ -1,3 +1,5 @@
+import asyncio
+import json
 from abc import ABC
 from typing import Any
 
@@ -83,11 +85,97 @@ class Adapter(ABC):
             return await self.viewer()
         raise CapabilityError(f"{self.kind} does not perform {operation}")
 
+    async def open_session(self, command: str) -> "ShellSession | None":
+        """Start a long-lived process for `command`, or None if unsupported."""
+        return None
+
     async def raw(self, operation: str, params: dict[str, Any]) -> Any:
         raise CapabilityError(f"{self.kind} does not expose raw operation {operation}")
 
     async def close(self) -> None:
         return None
+
+
+#: Accessibility trees are the largest thing a helper returns, and a browser's
+#: runs to megabytes on one line. asyncio's 64 KiB default made `readline` fail
+#: on exactly the applications worth inspecting, so sessions raise the ceiling.
+SESSION_STREAM_LIMIT = 16 * 1024 * 1024
+
+
+class ShellSession:
+    """A long-lived remote process exchanging newline-delimited JSON.
+
+    Some helpers pay a large fixed cost per connection -- libatspi initializes
+    by marshalling every application's accessible tree -- so re-spawning them
+    per call dominates the work they do. A session pays that once.
+    """
+
+    def __init__(self, process: Any, cleanup: Any = None):
+        self.process = process
+        self._cleanup = cleanup
+        self._lock = asyncio.Lock()
+
+    async def _readline(self, timeout: float) -> bytes:
+        try:
+            return await asyncio.wait_for(self.process.stdout.readline(), timeout)
+        except ValueError as error:
+            # readline turns an over-long line into a bare ValueError whose text
+            # says nothing about which limit was hit.
+            raise ActionError(
+                f"session reply exceeded {SESSION_STREAM_LIMIT} bytes; "
+                "narrow the request with max_depth or limit"
+            ) from error
+
+    async def banner(self, timeout: float) -> dict[str, Any]:
+        """Consume the greeting the server writes before any request.
+
+        Leaving it in the stream shifts every reply by one, so each call
+        receives the previous call's answer.
+        """
+        line = await self._readline(timeout)
+        if not line:
+            raise ActionError("session closed before announcing itself")
+        return json.loads(line)
+
+    async def request(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        async with self._lock:
+            if self.process.returncode is not None:
+                raise ActionError("session process has exited")
+            self.process.stdin.write((json.dumps(payload) + "\n").encode())
+            await self.process.stdin.drain()
+            line = await self._readline(timeout)
+        if not line:
+            raise ActionError("session closed before replying")
+        return json.loads(line)
+
+    async def close(self) -> None:
+        try:
+            if self.process.returncode is None:
+                self.process.stdin.close()
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), 5)
+        except (ProcessLookupError, asyncio.TimeoutError, OSError):
+            pass
+        finally:
+            if self._cleanup is not None:
+                self._cleanup.cleanup()
+
+
+def key_expressions(params: dict[str, Any]) -> list[str]:
+    """Normalize a key action's payload to a list of key expressions.
+
+    Every input backend accepted `key`/`keys` as either a string or a list and
+    repeated the same validation, which is how the x11 copy drifted far enough
+    to mangle keysym names. Splitting an expression on `+` stays with the
+    backend, since each one names modifiers differently.
+    """
+    values = params.get("keys", params.get("key"))
+    values = [values] if isinstance(values, str) else values
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) for value in values
+    ):
+        raise ActionError("key action requires a key string or list")
+    return values
 
 
 def require_shell_transport(

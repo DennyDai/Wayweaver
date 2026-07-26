@@ -7,7 +7,7 @@ from typing import Any
 from ..errors import ConfigError
 
 from ..types import Capability
-from .base import Adapter
+from .base import SESSION_STREAM_LIMIT, Adapter, ShellSession
 
 
 class LocalAdapter(Adapter):
@@ -42,6 +42,22 @@ class LocalAdapter(Adapter):
         if self.cwd is not None and not self.cwd.is_dir():
             return False, f"local working directory not found: {self.cwd}"
         return True, None
+
+    async def open_session(self, command: str) -> ShellSession | None:
+        environment = os.environ.copy()
+        environment.update(self.environment)
+        process = await asyncio.create_subprocess_exec(
+            self.executable,
+            "-c",
+            command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=str(self.cwd) if self.cwd else None,
+            env=environment,
+            limit=SESSION_STREAM_LIMIT,
+        )
+        return ShellSession(process)
 
     async def shell(
         self, command: str, stdin: bytes | None = None
