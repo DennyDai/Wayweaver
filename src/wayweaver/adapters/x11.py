@@ -486,9 +486,14 @@ class X11Adapter(Adapter):
         # as starting below where it actually does -- 24px for this window
         # manager, which is exactly the height of an application's menu bar.
         # Anything scoped to the window rectangle then excludes the menu bar.
+        # The listing has to fail loudly. wmctrl exits 1 when a window in
+        # _NET_CLIENT_LIST was destroyed between listing and querying it --
+        # X reports BadWindow and wmctrl gives up on the whole enumeration --
+        # and in a compound command the shell would report the exit status of
+        # the last part instead, turning a failed query into "no windows".
         output = (
             await self._run(
-                "wmctrl -lpGx; printf '%s\\n' ---; "
+                "wmctrl -lpGx || exit $?; printf '%s\\n' ---; "
                 "wmctrl -l | cut -d' ' -f1 | while read -r id; do "
                 "printf '%s %s\\n' \"$id\" \"$(xprop -id \"$id\" "
                 "_NET_FRAME_EXTENTS 2>/dev/null | sed -n 's/.*= //p' "
