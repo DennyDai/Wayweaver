@@ -218,5 +218,15 @@ class Router:
         )
 
     async def close(self) -> None:
-        for adapter in self.adapters.values():
-            await adapter.close()
+        # Closing is cleanup, and cleanup that stops at the first failure is
+        # how a multiplexed SSH socket, a helper process and a browser
+        # connection all outlive the run because one adapter raised.
+        results = await asyncio.gather(
+            *(adapter.close() for adapter in self.adapters.values()),
+            return_exceptions=True,
+        )
+        for outcome in results:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, Exception
+            ):
+                raise outcome

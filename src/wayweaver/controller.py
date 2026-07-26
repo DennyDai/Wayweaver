@@ -434,6 +434,45 @@ class Controller:
             if clock() >= deadline:
                 return last is not None and last != origin
 
+    async def _confirm_box(
+        self,
+        elements: Any,
+        options: dict[str, Any],
+        hint: str | None,
+        box: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-read an element's position before acting on it.
+
+        A page still laying out -- images arriving, a banner appearing above
+        the form -- moves an element after it resolves, and nothing in the
+        request hints that anything changed. Waiting only after a scroll caught
+        this by accident, so a resolve that happened not to scroll returned a
+        position the element had already left, and the click missed.
+
+        The capture taken for the surface check supplies the delay this needs,
+        so confirming an element that did not move costs one more query.
+        """
+        def spot(bounds: dict[str, Any]) -> tuple[int, int]:
+            return int(bounds.get("left", 0)), int(bounds.get("top", 0))
+
+        async def read() -> dict[str, Any] | None:
+            try:
+                found = await self._find_element(elements, options, hint)
+            except (CapabilityError, ActionError):
+                return None
+            bounds = found.get("bounds") if isinstance(found, dict) else None
+            if bounds and int(bounds.get("width", 0)) > 0:
+                return bounds
+            return None
+
+        current = await read()
+        if current is None or spot(current) == spot(box):
+            return box
+        # It moved once, so it is still moving. Wait for it to stop, then take
+        # the position it stopped at.
+        await self._await_moved(elements, options, current, hint=hint)
+        return await read() or current
+
     async def _element_point(
         self, target: str, options: dict[str, Any], allow_fallback: bool
     ) -> dict[str, Any]:
@@ -454,6 +493,7 @@ class Controller:
         scrolled = 0
         query = dict(options)
         hint = await self._application_hint(target)
+        elements: Any = None
         while True:
             try:
                 elements = await router.select(Capability.ELEMENTS)
@@ -505,14 +545,16 @@ class Controller:
             source, tier = "ocr", "visual"
             detail = {"text": match.get("text"), "confidence": match.get("confidence")}
 
-        point = {
-            "x": int(box["left"]) + int(box["width"]) // 2,
-            "y": int(box["top"]) + int(box["height"]) // 2,
-        }
         # The point is only usable if it lands on the surface that will act on
         # it. Layers can disagree -- a side channel may describe a desktop the
         # framebuffer does not show -- and clicking anyway lands somewhere else.
         frame, capture_name = await self.capture(target)
+        if tier == "semantic" and elements is not None:
+            box = await self._confirm_box(elements, query, hint, box)
+        point = {
+            "x": int(box["left"]) + int(box["width"]) // 2,
+            "y": int(box["top"]) + int(box["height"]) // 2,
+        }
         if not (0 <= point["x"] < frame.width and 0 <= point["y"] < frame.height):
             raise SurfaceError(
                 f"{tier} layer {source!r} reports a point outside the "
@@ -863,5 +905,12 @@ class Controller:
         return await self.router(target).raw(adapter, operation, params or {})
 
     async def close(self) -> None:
-        for router in self.routers.values():
-            await router.close()
+        results = await asyncio.gather(
+            *(router.close() for router in self.routers.values()),
+            return_exceptions=True,
+        )
+        for outcome in results:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, Exception
+            ):
+                raise outcome

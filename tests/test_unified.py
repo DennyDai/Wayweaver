@@ -279,6 +279,51 @@ class CDPTransportTests(unittest.TestCase):
         self.assertEqual(adapter._call("Runtime.evaluate", {}), {"value": 7})
 
 
+class CleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Cleanup that stops at the first failure leaks everything after it.
+
+    A multiplexed SSH socket, a helper process and a browser connection all
+    outlived the run because one unrelated adapter raised on close.
+    """
+
+    class Closer(StubAdapter):
+        def __init__(self, name, fail=False):
+            super().__init__(name, name, set())
+            self.fail = fail
+            self.closed = False
+
+        async def close(self):
+            if self.fail:
+                raise RuntimeError(f"{self.name} refused to close")
+            self.closed = True
+
+    def router(self, adapters):
+        router = Router.__new__(Router)
+        router.adapters = {adapter.name: adapter for adapter in adapters}
+        return router
+
+    async def test_one_failure_does_not_strand_the_others(self):
+        first = self.Closer("first")
+        broken = self.Closer("broken", fail=True)
+        last = self.Closer("last")
+        await self.router([first, broken, last]).close()
+        self.assertTrue(first.closed)
+        self.assertTrue(last.closed)
+
+    async def test_every_router_is_closed(self):
+        from wayweaver.controller import Controller
+
+        broken = self.Closer("broken", fail=True)
+        healthy = self.Closer("healthy")
+        controller = Controller.__new__(Controller)
+        controller.routers = {
+            "a": self.router([broken]),
+            "b": self.router([healthy]),
+        }
+        await controller.close()
+        self.assertTrue(healthy.closed)
+
+
 class ElementSearchScopeTests(unittest.IsolatedAsyncioTestCase):
     """Element searches are scoped to the active application when possible.
 
