@@ -54,13 +54,8 @@ def parse_tsv(tsv: str) -> list[Word]:
     return words
 
 
-async def recognize(
-    frame: Frame, shell: Adapter | None = None, psm: int | None = None
-) -> list[Word]:
-    arguments = ["stdin", "stdout"]
-    if psm is not None:
-        arguments += ["--psm", str(psm)]
-    arguments.append("tsv")
+async def recognize(frame: Frame, shell: Adapter | None = None) -> list[Word]:
+    arguments = ["stdin", "stdout", "tsv"]
     if command := shutil.which("tesseract"):
         process = await asyncio.create_subprocess_exec(
             command,
@@ -74,10 +69,9 @@ async def recognize(
             raise ActionError(stderr.decode(errors="replace").strip())
         return parse_tsv(stdout.decode(errors="replace"))
     if shell:
-        command_line = "tesseract stdin stdout"
-        if psm is not None:
-            command_line += f" --psm {psm}"
-        code, stdout, stderr = await shell.shell(command_line + " tsv", frame.png)
+        code, stdout, stderr = await shell.shell(
+            "tesseract stdin stdout tsv", frame.png
+        )
         if code:
             raise ActionError(stderr.decode(errors="replace").strip())
         return parse_tsv(stdout.decode(errors="replace"))
@@ -108,22 +102,48 @@ def find_text(words: list[Word], locator: str | dict[str, Any]) -> dict[str, Any
             raise ActionError("region right/bottom must exceed left/top")
     matches = []
     size = len(wanted)
-    for index in range(len(words) - size + 1):
-        group = words[index : index + size]
-        if size > 1 and any(word.line != group[0].line for word in group[1:]):
+    # How a recognizer splits a phrase into words is not stable: the same
+    # button read as "Don't" in one crop and "Dont" in another, which is three
+    # tokens against two and could never match token-for-token. Comparing the
+    # tokens joined together is indifferent to where the splits fall, so an
+    # exact match spans however many words the recognizer happened to produce.
+    wanted_joined = "".join(wanted)
+    groups: list[tuple[list[Word], bool]] = []
+    if not contains:
+        for index in range(len(words)):
+            joined = ""
+            for end in range(index, len(words)):
+                word = words[end]
+                if end > index and word.line != words[index].line:
+                    break
+                joined += word.token
+                if not wanted_joined.startswith(joined):
+                    break
+                if joined == wanted_joined:
+                    groups.append((words[index : end + 1], True))
+                    break
+    if contains or fuzzy:
+        for index in range(len(words) - size + 1):
+            group = words[index : index + size]
+            if size > 1 and any(word.line != group[0].line for word in group[1:]):
+                continue
+            seen = [word.token for word in group]
+            if contains and all(
+                target in value for target, value in zip(wanted, seen)
+            ):
+                groups.append((group, True))
+            elif fuzzy and all(
+                SequenceMatcher(None, target, value).ratio() >= similarity
+                for target, value in zip(wanted, seen)
+            ):
+                groups.append((group, False))
+    seen_spans: set[tuple[int, int, int, int]] = set()
+    for group, exact in groups:
+        span = (group[0].left, group[0].top, group[-1].left, group[-1].top)
+        if span in seen_spans:
             continue
+        seen_spans.add(span)
         seen = [word.token for word in group]
-        exact = (
-            all(target in value for target, value in zip(wanted, seen))
-            if contains
-            else seen == wanted
-        )
-        approximate = fuzzy and all(
-            SequenceMatcher(None, target, value).ratio() >= similarity
-            for target, value in zip(wanted, seen)
-        )
-        if not exact and not approximate:
-            continue
         left = min(word.left for word in group)
         top = min(word.top for word in group)
         right = max(word.left + word.width for word in group)
@@ -154,6 +174,15 @@ def find_text(words: list[Word], locator: str | dict[str, Any]) -> dict[str, Any
             if left_bound <= match["x"] <= right_bound
             and top_bound <= match["y"] <= bottom_bound
         ]
+    # Picking the first of several matches silently clicks whichever the
+    # recognizer happened to order first -- a URL bar rather than the button
+    # bearing the same word. `strict` turns that into a refusal.
+    if options.get("strict") and "nth" not in options and len(matches) > 1:
+        raise ActionError(
+            f"ambiguous text locator {text!r}: {len(matches)} matches; "
+            "narrow it with region, window, or nth",
+            details={"matches": len(matches), "total_matches": all_matches},
+        )
     nth = int(options.get("nth", 0))
     nth = nth if nth >= 0 else len(matches) + nth
     if not 0 <= nth < len(matches):
@@ -165,6 +194,40 @@ def find_text(words: list[Word], locator: str | dict[str, Any]) -> dict[str, Any
     if region is not None:
         result["region"] = list(map(int, region))
     return result
+
+
+def ocr_items(words: list[Word]) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    for word in words:
+        identity = (
+            word.line,
+            word.text,
+            word.left,
+            word.top,
+            word.width,
+            word.height,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        items.append(
+            {
+                "text": word.text,
+                "confidence": round(word.confidence, 1),
+                "point": {
+                    "x": round(word.left + word.width / 2),
+                    "y": round(word.top + word.height / 2),
+                },
+                "box": {
+                    "left": word.left,
+                    "top": word.top,
+                    "width": word.width,
+                    "height": word.height,
+                },
+            }
+        )
+    return items
 
 
 def text_output(words: list[Word]) -> str:
